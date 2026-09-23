@@ -1,0 +1,27 @@
+[package]
+name = "onetdns-dnssec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+onetdns-proto.workspace = true
+onetdns-core.workspace = true
+sha2.workspace = true
+sha1.workspace = true
+ed25519-dalek.workspace = true
+p256.workspace = true
+p384.workspace = true
+hmac.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+onetdns-core = { workspace = true, features = ["rsa-test-sign"] }
+
+[[bench]]
+name = "sign"
+harness = false
+
+[lints]
+workspace = true

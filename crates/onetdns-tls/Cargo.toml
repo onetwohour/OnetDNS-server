@@ -1,0 +1,27 @@
+[package]
+name = "onetdns-tls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+onetdns-core.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+x25519-dalek.workspace = true
+p256.workspace = true
+p384.workspace = true
+ed25519-dalek.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+rcgen = "0.13"
+onetdns-core = { workspace = true, features = ["rsa-test-sign"] }
+
+[lints]
+workspace = true

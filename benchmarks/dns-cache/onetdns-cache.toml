@@ -1,0 +1,14 @@
+mode = "personal"
+backend = "forward"
+listen = ["127.0.0.1:15353"]
+upstreams = []
+upstream_urls = ["udp://127.0.0.1:15400"]
+workers = 1
+do_udp = true
+do_tcp = false
+dnssec = false
+cache_enabled = true
+cache_size = 20000
+sharded_cache = false
+prefetch = false
+querylog = false

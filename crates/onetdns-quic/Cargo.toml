@@ -1,0 +1,24 @@
+[package]
+name = "onetdns-quic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+onetdns-tls.workspace = true
+onetdns-http2.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+aes-gcm.workspace = true
+aes = "0.8"
+chacha20poly1305.workspace = true
+chacha20 = "0.9"
+zeroize.workspace = true
+
+[dev-dependencies]
+rcgen = "0.13"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+
+[lints]
+workspace = true

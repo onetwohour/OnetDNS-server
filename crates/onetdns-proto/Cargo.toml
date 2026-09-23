@@ -1,0 +1,18 @@
+[package]
+name = "onetdns-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+hickory-proto = "0.26"
+
+[[bench]]
+name = "encode"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,30 @@
+# cargo-deny 정책. CI의 supply-chain 게이트가 이 파일로 검사한다.
+# 목적: RustSec 취약점·철회 크레이트 유입 차단, 라이선스 허용목록 강제, 출처 고정.
+
+[advisories]
+version = 2
+# 취약점·철회(yanked) 크레이트는 예외 없이 CI를 막는다.
+yanked = "deny"
+
+[licenses]
+version = 2
+# 워크스페이스는 Apache-2.0. 아래 목록은 의존성(암호 크레이트 등)에서 실제로 쓰이는
+# 라이선스라 MIT 도 남는다. 이 서버의 코드의 라이선스와는 별개다.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# 같은 크레이트 다중 버전은 경고(빌드는 통과), 와일드카드 버전은 경고.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+# crates.io 외 알 수 없는 레지스트리·git 출처는 차단(공급망 고정).
+unknown-registry = "deny"
+unknown-git = "deny"

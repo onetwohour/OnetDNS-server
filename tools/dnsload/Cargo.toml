@@ -1,0 +1,15 @@
+[package]
+name = "onetdns-dnsload"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+onetdns-proto = { path = "../../crates/onetdns-proto" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[workspace]

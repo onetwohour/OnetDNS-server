@@ -1,0 +1,205 @@
+name: Release
+
+# v 로 시작하는 태그를 올리면 대상마다 실행 파일을 빌드해 GitHub 릴리스에 올린다.
+# 태그 이름은 v 뒤에 Cargo.toml 의 [workspace.package] version 을 그대로 붙여야 하고,
+# 버전에 0.1.0-alpha.1 처럼 하이픈 꼬리가 있으면 시험판(pre-release)으로 올린다.
+# 이 워크플로는 테스트를 다시 돌리지 않으므로 main 의 CI 가 통과한 커밋에 태그를 붙인다.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: check tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Match tag and package version
+        id: version
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "onetdns") | .version')
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::태그와 패키지 버전이 맞지 않습니다(태그 $GITHUB_REF_NAME, 버전 $version). 태그 이름은 v 뒤에 버전을 그대로 붙여야 합니다."
+            exit 1
+          fi
+          case "${version%%+*}" in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: i686-unknown-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            emulator: qemu-aarch64
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+            emulator: qemu-arm
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: i686-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            emulator: arch -x86_64
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      EMULATOR: ${{ matrix.emulator }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install emulator (Linux)
+        if: runner.os == 'Linux' && matrix.emulator
+        run: sudo apt-get update && sudo apt-get install -y qemu-user
+
+      - name: Install Rosetta (macOS)
+        if: runner.os == 'macOS' && matrix.emulator
+        run: sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-D warnings"
+          case "$RUNNER_OS" in
+            # C 교차 컴파일러 없이 정적으로 링크하려고, 대상 표준 라이브러리에 들어 있는
+            # musl CRT 와 rust-lld 를 쓴다.
+            Linux) RUSTFLAGS="$RUSTFLAGS -C linker=rust-lld -C link-self-contained=yes" ;;
+            # C 런타임을 실행 파일에 넣어 VC++ 재배포 패키지가 없는 PC 에서도 실행되게 한다.
+            Windows) RUSTFLAGS="$RUSTFLAGS -C target-feature=+crt-static" ;;
+          esac
+          export RUSTFLAGS
+          cargo build -p onetdns --release --locked --target "$TARGET"
+
+      - name: Check linkage and version
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/OnetDNS"
+          case "$RUNNER_OS" in
+            Linux)
+              headers=$(readelf -lW "$bin")
+              if grep INTERP <<<"$headers"; then
+                echo "::error::동적 로더가 필요한 실행 파일입니다. 정적 링크가 풀렸습니다."
+                exit 1
+              fi
+              ;;
+            Windows)
+              bin="$bin.exe"
+              if grep -aqiE 'vcruntime[0-9]+\.dll|api-ms-win-crt-' "$bin"; then
+                echo "::error::C 런타임 DLL 이 필요한 실행 파일입니다. 정적 C 런타임이 빠졌습니다."
+                exit 1
+              fi
+              ;;
+          esac
+          reported=$($EMULATOR "$bin" --version)
+          if [ "$reported" != "OnetDNS $VERSION" ]; then
+            echo "::error::--version 출력이 예상과 다릅니다(출력 '$reported', 예상 'OnetDNS $VERSION')."
+            exit 1
+          fi
+          echo "$reported"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="OnetDNS-$VERSION-$TARGET"
+          mkdir -p "pkg/$name" dist
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp "target/$TARGET/release/OnetDNS.exe" LICENSE README.md "pkg/$name/"
+            (cd pkg && 7z a -tzip "../dist/$name.zip" "$name")
+          else
+            install -m 755 "target/$TARGET/release/OnetDNS" "pkg/$name/"
+            install -m 644 LICENSE README.md "pkg/$name/"
+            # 러너 계정의 uid 가 소유자로 기록되면, root 로 풀었을 때 같은 uid 를 가진
+            # 계정이 실행 파일을 바꿀 수 있다. 소유자를 root 로 적는다.
+            if [ "$RUNNER_OS" = macOS ]; then
+              owner=(--uid 0 --gid 0)
+            else
+              owner=(--owner=0 --group=0 --numeric-owner)
+            fi
+            tar "${owner[@]}" -C pkg -czf "dist/$name.tar.gz" "$name"
+          fi
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum OnetDNS-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/notes.md"
+          : > "$notes"
+          if [ "$PRERELEASE" = true ]; then
+            printf '%s\n\n' "시험판입니다. 설정 파일 형식과 관리 API 는 예고 없이 바뀔 수 있습니다." >> "$notes"
+          fi
+          cat >> "$notes" <<'EOF'
+          Linux 용은 musl 로 정적 링크해 배포판을 가리지 않고, Windows 용은 C 런타임을 넣어 두어 VC++ 재배포 패키지 없이 실행됩니다.
+
+          받은 파일은 함께 올린 `SHA256SUMS` 로 확인하십시오.
+
+          ```sh
+          sha256sum -c SHA256SUMS --ignore-missing
+          ```
+          EOF
+          args=(--repo "$GITHUB_REPOSITORY" --verify-tag --title "OnetDNS $VERSION" --notes-file "$notes")
+          if [ "$PRERELEASE" = true ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* "${args[@]}"

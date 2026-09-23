@@ -1,0 +1,22 @@
+[package]
+name = "onetdns-filter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+onetdns-core.workspace = true
+onetdns-proto.workspace = true
+sha2.workspace = true
+
+[[bench]]
+name = "verdict"
+harness = false
+
+[[bench]]
+name = "domain_memory"
+harness = false
+
+[lints]
+workspace = true

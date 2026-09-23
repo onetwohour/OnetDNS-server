@@ -1,0 +1,16 @@
+[package]
+name = "onetdns-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+onetdns-core.workspace = true
+onetdns-proto.workspace = true
+
+[dev-dependencies]
+wat = "1"
+
+[lints]
+workspace = true

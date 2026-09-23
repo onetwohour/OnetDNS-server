@@ -1,0 +1,21 @@
+[package]
+name = "onetdns-recurse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+onetdns-proto.workspace = true
+onetdns-forward.workspace = true
+onetdns-dnssec.workspace = true
+onetdns-core.workspace = true
+
+[dev-dependencies]
+p256 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+mode = "personal"
+backend = "forward"
+listen = ["127.0.0.1:15357"]
+upstreams = []
+upstream_urls = ["udp://127.0.0.1:15400"]
+workers = 1
+do_udp = true
+do_tcp = false
+cache_enabled = false
+querylog = false
+blocklists = ["/home/ubuntu/onetdns-bench/filterbench/blocklist.txt"]

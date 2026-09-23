@@ -1,0 +1,11 @@
+[package]
+name = "onetdns-tls-diff"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+onetdns-tls = { path = "../../crates/onetdns-tls" }
+rustls = { version = "0.23", default-features = false }
+
+[workspace]

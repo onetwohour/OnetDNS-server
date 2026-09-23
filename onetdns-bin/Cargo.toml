@@ -1,0 +1,46 @@
+[package]
+name = "onetdns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "OnetDNS"
+path = "src/main.rs"
+
+[features]
+default = ["dashboard"]
+dashboard = ["onetdns-control/dashboard"]
+
+[dependencies]
+onetdns-core.workspace = true
+onetdns-config.workspace = true
+onetdns-proto.workspace = true
+onetdns-runtime.workspace = true
+onetdns-forward.workspace = true
+onetdns-recurse.workspace = true
+onetdns-security.workspace = true
+onetdns-transport.workspace = true
+onetdns-tls.workspace = true
+onetdns-http2.workspace = true
+onetdns-quic.workspace = true
+onetdns-control = { workspace = true, default-features = false }
+onetdns-dnscrypt.workspace = true
+onetdns-filter.workspace = true
+onetdns-policy.workspace = true
+onetdns-authority.workspace = true
+onetdns-cluster.workspace = true
+onetdns-dnssec.workspace = true
+p256.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+wat = "1"
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+/target
+/.*/
+!/.github/
+/benchmarks/dns-recurse/blocklist-cache/
+/benchmarks/dns-cache/blocklist-cache/
+
+/fuzz/target/
+
+/tools/*/target/
+
+/docs/
+/*.md
+!/README.md
+
+/onetdns-bin/tests/docs_drift.rs

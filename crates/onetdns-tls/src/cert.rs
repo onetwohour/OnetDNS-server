@@ -1,0 +1,476 @@
+/*!
+ * @brief 인증서 메시지와 서명 검증.
+ *
+ * @details 상대가 보낸 체인을 읽고, 그 개인키를 실제로 갖고 있는지 서명으로 확인한다.
+ * @warning 서명 대상에는 고정 접두사와 방향 문자열이 들어간다. 그것이 있어야 클라이언트
+ *          서명을 서버 서명으로 재사용하는 교차 프로토콜 공격이 막힌다.
+ */
+
+use crate::msg::consts;
+use crate::wire::{Reader, Writer};
+use crate::TlsError;
+
+/** @brief 체인에 담을 수 있는 인증서 수. */
+pub(crate) const MAX_CERTIFICATE_ENTRIES: usize = 16;
+
+/** @brief 체인 구성이 온전한지. 빈 항목이나 지나친 개수를 거른다. */
+pub(crate) fn certificate_chain_is_valid(chain: &[Vec<u8>], allow_empty: bool) -> bool {
+    if chain.is_empty() {
+        return allow_empty;
+    }
+    if chain.len() > MAX_CERTIFICATE_ENTRIES || chain.iter().any(Vec::is_empty) {
+        return false;
+    }
+    chain
+        .iter()
+        .try_fold(4usize, |size, certificate| {
+            size.checked_add(5)?.checked_add(certificate.len())
+        })
+        .is_some_and(|size| size <= crate::handshake::MAX_HANDSHAKE_MESSAGE)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/** @brief 인증서 하나와 그에 붙은 확장. */
+pub struct CertEntry {
+    /** @brief 인증서 바이트. */
+    pub cert_data: Vec<u8>,
+    /** @brief 이 인증서에 딸린 확장. */
+    pub extensions: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/** @brief 인증서 메시지. */
+pub struct CertificateMsg {
+    /** @brief 어느 요청에 대한 답인지. */
+    pub request_context: Vec<u8>,
+    /** @brief 보낸 인증서들. 리프부터 순서대로. */
+    pub entries: Vec<CertEntry>,
+}
+
+impl CertificateMsg {
+    /** @brief 인증서 메시지를 읽는다. */
+    pub fn parse(body: &[u8]) -> Result<CertificateMsg, TlsError> {
+        let mut r = Reader::new(body);
+        let request_context = r.vec8()?.to_vec();
+        let list = r.vec24()?;
+        if !r.is_empty() {
+            return Err(TlsError::Decode);
+        }
+        let mut lr = Reader::new(list);
+        let mut entries = Vec::new();
+        while !lr.is_empty() {
+            let cert_data = lr.vec24()?.to_vec();
+            if cert_data.is_empty() || entries.len() >= MAX_CERTIFICATE_ENTRIES {
+                return Err(TlsError::RecordOverflow);
+            }
+            let extensions = lr.vec16()?.to_vec();
+            entries.push(CertEntry {
+                cert_data,
+                extensions,
+            });
+        }
+        Ok(CertificateMsg {
+            request_context,
+            entries,
+        })
+    }
+
+    /** @brief 인증서 메시지를 쓴다. */
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.vec8(|w| w.bytes(&self.request_context));
+        w.vec24(|w| {
+            for e in &self.entries {
+                w.vec24(|w| w.bytes(&e.cert_data));
+                w.vec16(|w| w.bytes(&e.extensions));
+            }
+        });
+        w.buf
+    }
+
+    /** @brief 체인의 첫 인증서. 상대의 신원이 여기 있다. */
+    pub fn leaf(&self) -> Option<&[u8]> {
+        self.entries.first().map(|e| e.cert_data.as_slice())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/** @brief 클라이언트 인증서 요청. */
+pub struct CertificateRequestMsg {
+    /** @brief 어느 요청인지 구분하는 값. */
+    pub context: Vec<u8>,
+    /** @brief 무엇을 받아들일지 알리는 확장. */
+    pub extensions: Vec<crate::msg::Extension>,
+}
+
+impl CertificateRequestMsg {
+    /** @brief 이쪽이 지원하는 서명 방식을 담은 표준 요청. */
+    pub fn standard() -> Self {
+        CertificateRequestMsg {
+            context: Vec::new(),
+            extensions: vec![crate::msg::Extension::signature_algorithms(&[
+                consts::ED25519,
+                consts::ECDSA_SECP256R1_SHA256,
+                consts::ECDSA_SECP384R1_SHA384,
+                consts::RSA_PSS_RSAE_SHA256,
+                consts::RSA_PKCS1_SHA256,
+            ])],
+        }
+    }
+
+    /** @brief 인증서를 달라는 메시지를 읽는다. */
+    pub fn parse(body: &[u8]) -> Result<CertificateRequestMsg, TlsError> {
+        let mut r = Reader::new(body);
+        let context = r.vec8()?.to_vec();
+        let extensions = crate::msg::Extension::parse_list(r.vec16()?)?;
+        if !r.is_empty() {
+            return Err(TlsError::Decode);
+        }
+        Ok(CertificateRequestMsg {
+            context,
+            extensions,
+        })
+    }
+
+    /** @brief 인증서를 달라는 메시지를 적는다. */
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.vec8(|w| w.bytes(&self.context));
+        w.vec16(|w| {
+            for e in &self.extensions {
+                e.encode_into(w);
+            }
+        });
+        w.buf
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/** @brief 개인키 소유를 증명하는 서명. */
+pub struct CertificateVerify {
+    /** @brief 서명에 쓴 방식. */
+    pub algorithm: u16,
+    /** @brief 서명. */
+    pub signature: Vec<u8>,
+}
+
+impl CertificateVerify {
+    /** @brief 인증서 소유 증명을 읽는다. */
+    pub fn parse(body: &[u8]) -> Result<CertificateVerify, TlsError> {
+        let mut r = Reader::new(body);
+        let algorithm = r.u16()?;
+        let signature = r.vec16()?.to_vec();
+        if signature.is_empty() || !r.is_empty() {
+            return Err(TlsError::Decode);
+        }
+        Ok(CertificateVerify {
+            algorithm,
+            signature,
+        })
+    }
+
+    /** @brief 인증서 소유 증명을 적는다. */
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u16(self.algorithm);
+        w.vec16(|w| w.bytes(&self.signature));
+        w.buf
+    }
+}
+
+/**
+ * @brief 서명 대상 바이트를 만든다.
+ * @details 공백 64개, 방향을 뜻하는 문자열, 구분자, 그리고 핸드셰이크 기록 해시를 잇는다.
+ * @warning 방향 문자열이 다르므로 클라이언트 서명을 서버 서명으로 되쓸 수 없다. 이것이
+ *          교차 프로토콜 공격을 막는 장치다.
+ */
+pub fn certificate_verify_content(transcript_hash: &[u8], server: bool) -> Vec<u8> {
+    let context: &[u8] = if server {
+        b"TLS 1.3, server CertificateVerify"
+    } else {
+        b"TLS 1.3, client CertificateVerify"
+    };
+    let mut c = vec![0x20u8; 64];
+    c.extend_from_slice(context);
+    c.push(0x00);
+    c.extend_from_slice(transcript_hash);
+    c
+}
+
+/** @brief 서명 방식에 맞는 검증기로 넘긴다. 모르는 방식은 거부한다. */
+pub fn verify_signature(
+    scheme: u16,
+    public_key: &[u8],
+    content: &[u8],
+    signature: &[u8],
+) -> Result<(), TlsError> {
+    match scheme {
+        consts::ED25519 => verify_ed25519(public_key, content, signature),
+        consts::ECDSA_SECP256R1_SHA256 => verify_ecdsa_p256(public_key, content, signature),
+        consts::ECDSA_SECP384R1_SHA384 => verify_ecdsa_p384(public_key, content, signature),
+        consts::RSA_PSS_RSAE_SHA256 => verify_rsa_pss_sha256(public_key, content, signature),
+        consts::RSA_PSS_RSAE_SHA384 => verify_rsa_pss_sha384(public_key, content, signature),
+        consts::RSA_PSS_RSAE_SHA512 => verify_rsa_pss_sha512(public_key, content, signature),
+        consts::RSA_PKCS1_SHA256 => verify_rsa_pkcs1_sha256(public_key, content, signature),
+        consts::RSA_PKCS1_SHA384 => verify_rsa_pkcs1_sha384(public_key, content, signature),
+        consts::RSA_PKCS1_SHA512 => verify_rsa_pkcs1_sha512(public_key, content, signature),
+        other => Err(TlsError::UnsupportedSig(other)),
+    }
+}
+
+/** @brief Ed25519 서명 검증. */
+fn verify_ed25519(pk: &[u8], content: &[u8], sig: &[u8]) -> Result<(), TlsError> {
+    let pk: [u8; 32] = pk.try_into().map_err(|_| TlsError::BadCert)?;
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk).map_err(|_| TlsError::BadCert)?;
+    let sig: [u8; 64] = sig.try_into().map_err(|_| TlsError::BadSignature)?;
+    vk.verify_strict(content, &ed25519_dalek::Signature::from_bytes(&sig))
+        .map_err(|_| TlsError::BadSignature)
+}
+
+/** @brief P-256 ECDSA 서명 검증. */
+fn verify_ecdsa_p256(pk: &[u8], content: &[u8], sig: &[u8]) -> Result<(), TlsError> {
+    use p256::ecdsa::signature::Verifier;
+    let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(pk).map_err(|_| TlsError::BadCert)?;
+    let sig = p256::ecdsa::Signature::from_der(sig).map_err(|_| TlsError::BadSignature)?;
+    vk.verify(content, &sig).map_err(|_| TlsError::BadSignature)
+}
+
+/** @brief P-384 ECDSA 서명 검증. */
+fn verify_ecdsa_p384(pk: &[u8], content: &[u8], sig: &[u8]) -> Result<(), TlsError> {
+    use p384::ecdsa::signature::Verifier;
+    let vk = p384::ecdsa::VerifyingKey::from_sec1_bytes(pk).map_err(|_| TlsError::BadCert)?;
+    let sig = p384::ecdsa::Signature::from_der(sig).map_err(|_| TlsError::BadSignature)?;
+    vk.verify(content, &sig).map_err(|_| TlsError::BadSignature)
+}
+
+macro_rules! rsa_verify {
+    ($name:ident, $verify:path, $hash:expr) => {
+        /** @brief 이 알고리즘으로 서명을 검증한다. */
+        fn $name(pk: &[u8], content: &[u8], sig: &[u8]) -> Result<(), TlsError> {
+            let (n, e) = crate::x509::rsa_public_key_components(pk)?;
+            $verify($hash, n, e, content, sig).map_err(|err| match err {
+                onetdns_core::rsa::RsaError::BadKey => TlsError::BadCert,
+                onetdns_core::rsa::RsaError::BadSignature => TlsError::BadSignature,
+            })
+        }
+    };
+}
+use onetdns_core::rsa::{verify_pkcs1, verify_pss, RsaHash};
+rsa_verify!(verify_rsa_pss_sha256, verify_pss, RsaHash::Sha256);
+rsa_verify!(verify_rsa_pss_sha384, verify_pss, RsaHash::Sha384);
+rsa_verify!(verify_rsa_pss_sha512, verify_pss, RsaHash::Sha512);
+rsa_verify!(verify_rsa_pkcs1_sha256, verify_pkcs1, RsaHash::Sha256);
+rsa_verify!(verify_rsa_pkcs1_sha384, verify_pkcs1, RsaHash::Sha384);
+rsa_verify!(verify_rsa_pkcs1_sha512, verify_pkcs1, RsaHash::Sha512);
+
+#[cfg(test)]
+/** @brief 메시지 왕복, 서명 대상 배치, 그리고 방식별 검증. */
+mod tests {
+    use super::*;
+
+    #[test]
+    /** @brief 인증서 메시지 왕복. */
+    fn certificate_msg_roundtrip() {
+        let cm = CertificateMsg {
+            request_context: vec![],
+            entries: vec![
+                CertEntry {
+                    cert_data: vec![0xAA; 50],
+                    extensions: vec![],
+                },
+                CertEntry {
+                    cert_data: vec![0xBB; 30],
+                    extensions: vec![],
+                },
+            ],
+        };
+        let body = cm.encode();
+        let back = CertificateMsg::parse(&body).unwrap();
+        assert_eq!(back, cm);
+        assert_eq!(back.leaf().unwrap().len(), 50);
+    }
+
+    #[test]
+    /** @brief 빈 항목과 지나친 개수를 거부하는지. */
+    fn certificate_message_rejects_trailing_empty_and_excessive_entries() {
+        let valid = CertificateMsg {
+            request_context: Vec::new(),
+            entries: vec![CertEntry {
+                cert_data: vec![1],
+                extensions: Vec::new(),
+            }],
+        }
+        .encode();
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        assert!(CertificateMsg::parse(&trailing).is_err());
+
+        let empty = CertificateMsg {
+            request_context: Vec::new(),
+            entries: vec![CertEntry {
+                cert_data: Vec::new(),
+                extensions: Vec::new(),
+            }],
+        }
+        .encode();
+        assert!(CertificateMsg::parse(&empty).is_err());
+
+        let excessive = CertificateMsg {
+            request_context: Vec::new(),
+            entries: (0..=MAX_CERTIFICATE_ENTRIES)
+                .map(|_| CertEntry {
+                    cert_data: vec![1],
+                    extensions: Vec::new(),
+                })
+                .collect(),
+        }
+        .encode();
+        assert!(CertificateMsg::parse(&excessive).is_err());
+    }
+
+    #[test]
+    /** @brief 서명 메시지 왕복. */
+    fn certificate_verify_roundtrip() {
+        let cv = CertificateVerify {
+            algorithm: consts::ED25519,
+            signature: vec![0x11; 64],
+        };
+        let body = cv.encode();
+        assert_eq!(CertificateVerify::parse(&body).unwrap(), cv);
+
+        let mut trailing = body;
+        trailing.push(0);
+        assert!(CertificateVerify::parse(&trailing).is_err());
+        assert!(CertificateVerify::parse(&[0x08, 0x07, 0, 0]).is_err());
+
+        let mut request = CertificateRequestMsg::standard().encode();
+        request.push(0);
+        assert!(CertificateRequestMsg::parse(&request).is_err());
+    }
+
+    #[test]
+    /** @brief 서명 대상 배치가 규격과 맞는지. 다르면 다른 구현과 통하지 않는다. */
+    fn cv_content_layout() {
+        let th = [0xCDu8; 32];
+        let c = certificate_verify_content(&th, true);
+        assert_eq!(&c[..64], &[0x20u8; 64]);
+        assert_eq!(&c[64..64 + 33], b"TLS 1.3, server CertificateVerify");
+        assert_eq!(c[64 + 33], 0x00);
+        assert_eq!(&c[64 + 34..], &th);
+
+        assert_ne!(certificate_verify_content(&th, false), c);
+    }
+
+    #[test]
+    /** @brief Ed25519 검증. */
+    fn ed25519_certificate_verify() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let content = certificate_verify_content(&[0x55; 32], true);
+        let sig = sk.sign(&content).to_bytes().to_vec();
+        let pk = sk.verifying_key().to_bytes().to_vec();
+        assert_eq!(
+            verify_signature(consts::ED25519, &pk, &content, &sig),
+            Ok(())
+        );
+
+        let bad = certificate_verify_content(&[0x66; 32], true);
+        assert!(verify_signature(consts::ED25519, &pk, &bad, &sig).is_err());
+    }
+
+    #[test]
+    /** @brief P-256 검증. */
+    fn ecdsa_p256_certificate_verify() {
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+        let sk = SigningKey::from_slice(&[0x42u8; 32]).unwrap();
+        let content = certificate_verify_content(&[0x77; 32], true);
+        let sig: Signature = sk.sign(&content);
+        let sig_der = sig.to_der().as_bytes().to_vec();
+        let pk = sk
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        assert_eq!(
+            verify_signature(consts::ECDSA_SECP256R1_SHA256, &pk, &content, &sig_der),
+            Ok(())
+        );
+        let mut bad_sig = sig_der.clone();
+        let n = bad_sig.len();
+        bad_sig[n - 1] ^= 0xFF;
+        assert!(verify_signature(consts::ECDSA_SECP256R1_SHA256, &pk, &content, &bad_sig).is_err());
+    }
+
+    #[test]
+    /** @brief P-384 검증. */
+    fn ecdsa_p384_certificate_verify() {
+        use p384::ecdsa::{signature::Signer, Signature, SigningKey};
+        let sk = SigningKey::from_slice(&[0x37u8; 48]).unwrap();
+        let content = certificate_verify_content(&[0x88; 48], true);
+        let sig: Signature = sk.sign(&content);
+        let sig_der = sig.to_der().as_bytes().to_vec();
+        let pk = sk
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        assert_eq!(pk.len(), 97);
+        assert_eq!(
+            verify_signature(consts::ECDSA_SECP384R1_SHA384, &pk, &content, &sig_der),
+            Ok(())
+        );
+        let mut bad = sig_der.clone();
+        let n = bad.len();
+        bad[n - 1] ^= 0xFF;
+        assert!(verify_signature(consts::ECDSA_SECP384R1_SHA384, &pk, &content, &bad).is_err());
+    }
+
+    #[test]
+    /** @brief 모르는 서명 방식을 거부하는지. */
+    fn unknown_scheme_rejected() {
+        assert!(matches!(
+            verify_signature(0, &[1, 2, 3], b"x", &[4, 5, 6]),
+            Err(TlsError::UnsupportedSig(0))
+        ));
+    }
+
+    #[test]
+    /** @brief 지금 쓰는 모든 RSA 방식이 검증되는지. */
+    fn rsa_certificate_verify_all_current_schemes() {
+        use onetdns_core::rsa::testsign::TestRsaKey;
+
+        let private_der = crate::trust::base64_decode(include_bytes!(
+            "../../../testdata/rsa_test_private_key_2048.pk8.b64"
+        ))
+        .unwrap();
+        let key = TestRsaKey::from_pkcs8(&private_der).unwrap();
+        let pk_der = key.public_key_der();
+        let content = certificate_verify_content(&[0x99; 32], true);
+        let cases = [
+            (consts::RSA_PSS_RSAE_SHA256, RsaHash::Sha256, true),
+            (consts::RSA_PSS_RSAE_SHA384, RsaHash::Sha384, true),
+            (consts::RSA_PSS_RSAE_SHA512, RsaHash::Sha512, true),
+            (consts::RSA_PKCS1_SHA256, RsaHash::Sha256, false),
+            (consts::RSA_PKCS1_SHA384, RsaHash::Sha384, false),
+            (consts::RSA_PKCS1_SHA512, RsaHash::Sha512, false),
+        ];
+        for (scheme, hash, pss) in cases {
+            let mut signature = if pss {
+                let salt: Vec<u8> = (0..hash.digest_len() as u8).map(|i| i ^ 0x5a).collect();
+                key.sign_pss(hash, &content, &salt)
+            } else {
+                key.sign_pkcs1(hash, &content)
+            };
+            assert_eq!(
+                verify_signature(scheme, &pk_der, &content, &signature),
+                Ok(()),
+                "scheme {scheme:#06x}"
+            );
+            signature[0] ^= 0xff;
+            assert!(
+                verify_signature(scheme, &pk_der, &content, &signature).is_err(),
+                "scheme {scheme:#06x} tamper"
+            );
+        }
+    }
+}

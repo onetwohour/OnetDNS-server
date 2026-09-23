@@ -1,0 +1,29 @@
+[package]
+name = "onetdns-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+onetdns-proto.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+
+[features]
+# RSA 테스트 서명기(rsa::testsign)를 외부 크레이트 테스트에 노출한다.
+rsa-test-sign = []
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "isolation"
+harness = false
+
+[[bench]]
+name = "lrumap"
+harness = false

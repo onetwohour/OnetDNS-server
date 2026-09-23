@@ -1,0 +1,84 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/onetdns-proto",
+    "crates/onetdns-runtime",
+    "crates/onetdns-forward",
+    "crates/onetdns-recurse",
+    "crates/onetdns-dnssec",
+    "crates/onetdns-tls",
+    "crates/onetdns-http2",
+    "crates/onetdns-quic",
+    "crates/onetdns-core",
+    "crates/onetdns-config",
+    "crates/onetdns-security",
+    "crates/onetdns-filter",
+    "crates/onetdns-transport",
+    "crates/onetdns-control",
+    "crates/onetdns-dnscrypt",
+    "crates/onetdns-policy",
+    "crates/onetdns-authority",
+    "crates/onetdns-cluster",
+    "onetdns-bin",
+]
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+
+[workspace.lints.clippy]
+type_complexity = "allow"             # 콜백 구조체(Controls)·프로토콜 상태 맵
+should_implement_trait = "allow"      # Name::from_str / Der::next 등 의도적 고유 메서드
+result_unit_err = "allow"             # 내부 QPACK 등 Result<_, ()>
+while_let_loop = "allow"              # 전송 파서 루프 — 기계적 재작성이 비확정(회귀 위험)
+field_reassign_with_default = "allow" # 테스트 빌더 패턴
+doc_lazy_continuation = "allow"       # 문서 주석 렌더링(기능 무관)
+single_match = "allow"                # match 1-arm 스타일
+len_without_is_empty = "allow"        # Hash::len은 digest 길이(컬렉션 크기 아님)
+
+[workspace.dependencies]
+onetdns-proto = { version = "0.1.0-alpha.1", path = "crates/onetdns-proto" }
+onetdns-runtime = { version = "0.1.0-alpha.1", path = "crates/onetdns-runtime" }
+onetdns-forward = { version = "0.1.0-alpha.1", path = "crates/onetdns-forward" }
+onetdns-recurse = { version = "0.1.0-alpha.1", path = "crates/onetdns-recurse" }
+onetdns-dnssec = { version = "0.1.0-alpha.1", path = "crates/onetdns-dnssec" }
+onetdns-tls = { version = "0.1.0-alpha.1", path = "crates/onetdns-tls" }
+onetdns-http2 = { version = "0.1.0-alpha.1", path = "crates/onetdns-http2" }
+onetdns-quic = { version = "0.1.0-alpha.1", path = "crates/onetdns-quic" }
+onetdns-core = { version = "0.1.0-alpha.1", path = "crates/onetdns-core" }
+onetdns-config = { version = "0.1.0-alpha.1", path = "crates/onetdns-config" }
+onetdns-security = { version = "0.1.0-alpha.1", path = "crates/onetdns-security" }
+onetdns-filter = { version = "0.1.0-alpha.1", path = "crates/onetdns-filter" }
+onetdns-transport = { version = "0.1.0-alpha.1", path = "crates/onetdns-transport" }
+onetdns-control = { version = "0.1.0-alpha.1", path = "crates/onetdns-control", default-features = false }
+onetdns-dnscrypt = { version = "0.1.0-alpha.1", path = "crates/onetdns-dnscrypt" }
+onetdns-policy = { version = "0.1.0-alpha.1", path = "crates/onetdns-policy" }
+onetdns-authority = { version = "0.1.0-alpha.1", path = "crates/onetdns-authority" }
+onetdns-cluster = { version = "0.1.0-alpha.1", path = "crates/onetdns-cluster" }
+
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["pkcs8"] }
+chacha20poly1305 = "0.10"
+
+sha2 = { version = "0.10", features = ["oid"] }
+sha1 = { version = "0.10", features = ["oid"] }
+hkdf = "0.12"
+hmac = "0.12"
+aes-gcm = "0.10"
+p256 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+zeroize = "1"
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "unwind"
+
+[profile.release-min]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
