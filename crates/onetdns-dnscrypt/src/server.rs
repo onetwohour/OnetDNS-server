@@ -153,12 +153,13 @@ where
     H: Fn(Vec<u8>, SocketAddr, usize) -> Option<Vec<u8>>,
     A: Fn(SocketAddr) -> bool,
 {
-    if let Err(error) = socket.set_read_timeout(Some(std::time::Duration::from_millis(500))) {
+    let wait = onetdns_core::udp::RecvWait::new(std::time::Duration::from_millis(500));
+    if let Err(error) = wait.install(&socket) {
         onetdns_core::error!(event = "dnscrypt.read_timeout_failed", %error, "수신에 제한 시간을 걸지 못했습니다. 설정을 다시 읽을 때 이 스레드가 끝나지 않아 포트가 묶입니다");
     }
     let mut buf = vec![0u8; 4096];
     while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-        let (n, src) = match socket.recv_from(&mut buf) {
+        let (n, src) = match wait.recv_from(&socket, &mut buf) {
             Ok(x) => x,
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock

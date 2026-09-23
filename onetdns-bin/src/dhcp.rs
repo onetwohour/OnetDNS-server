@@ -1862,11 +1862,12 @@ pub fn spawn_dhcp(
     use onetdns_core::MutexExt;
     let sock = onetdns_core::udp::bind((Ipv4Addr::UNSPECIFIED, port))?;
     sock.set_broadcast(true)?;
-    sock.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let wait = onetdns_core::udp::RecvWait::new(Duration::from_millis(500));
+    wait.install(&sock)?;
     std::thread::Builder::new().name("dhcp".into()).spawn(move || {
         let mut buf = vec![0u8; DHCP4_RECV_CAPACITY];
         while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            let n = match sock.recv_from(&mut buf) {
+            let n = match wait.recv_from(&sock, &mut buf) {
                 Ok((n, _)) => n,
                 Err(error) => {
                     if !matches!(

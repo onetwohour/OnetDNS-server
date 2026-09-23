@@ -72,6 +72,12 @@ const MAX_ACK_RANGES: usize = 32;
 const MAX_RECV_PACKET_HISTORY: usize = u128::BITS as usize;
 /** @brief 흐름 제어 값의 상한. 상대가 부른 값을 여기서 자른다. */
 const MAX_FLOW_CONTROL: u64 = 1 << 60;
+/**
+ * @brief PTO 한 번에 혼잡 윈도우를 넘겨 보낼 수 있는 패킷 수.
+ * @details RFC 9002 가 허용하는 두 개다. 데이터그램 하나를 잃었다고 바로 다음 PTO 까지
+ *          기다리지 않게 하되, 윈도우를 무시하는 양은 이만큼으로 묶는다.
+ */
+const PROBE_PACKETS: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /** @brief 패킷 종류. 확인 처리 방식이 갈린다. */
@@ -473,6 +479,23 @@ struct SpaceState {
 
     /** @brief 다시 보내야 할 프레임들. */
     rtx: Vec<Frame>,
+
+    /** @brief 상대가 확인한 가장 큰 패킷 번호. 손실 판정의 기준이다. */
+    largest_acked: Option<u64>,
+    /**
+     * @brief 확인을 끌어내는 패킷을 이 공간에서 마지막으로 보낸 시각.
+     * @details PTO 는 가장 오래된 미확인 패킷이 아니라 이 시각에서 잰다. 오래된 패킷에서 재면
+     *          프로브를 보낸 직후에도 데드라인이 이미 지나 있어 지수 증가가 먹히지 않는다.
+     */
+    last_ack_eliciting_ms: u64,
+    /** @brief 시간 기준으로 아직 잃었다고 볼 수 없는 패킷이 잃은 것으로 바뀌는 시각. */
+    loss_time_ms: Option<u64>,
+    /**
+     * @brief 이 공간의 키와 상태를 버렸는지.
+     * @details 버린 공간은 다시 살리지 않는다. 늦게 온 Initial 로 키를 다시 만들면 끝난
+     *          핸드셰이크 상태가 되살아난다.
+     */
+    discarded: bool,
 }
 
 impl SpaceState {
@@ -572,7 +595,11 @@ pub struct Connection {
     initial_dcid: Vec<u8>,
     /** @brief 핸드셰이크가 끝났는지. */
     handshake_complete: bool,
-    /** @brief 상대도 핸드셰이크가 끝났음을 확인했는지. */
+    /**
+     * @brief 핸드셰이크가 확정됐는지.
+     * @details 서버는 핸드셰이크가 끝나는 순간, 클라이언트는 HANDSHAKE_DONE 을 받았을 때
+     *          확정된다. 확정되면 Initial 과 Handshake 공간을 버리고 응용 데이터 PTO 를 건다.
+     */
     handshake_confirmed: bool,
     /** @brief 핸드셰이크 결과가 앞선 세션을 재개한 것인지. 서버 TLS 상태를 버린 뒤에도 남긴다. */
     handshake_resumed: bool,
@@ -686,6 +713,9 @@ pub struct Connection {
 
     /** @brief 지금까지 본 가장 짧은 왕복 시간. */
     min_rtt_ms: u64,
+
+    /** @brief 마지막으로 잰 왕복 시간. 부하로 튄 표본이 손실 판정을 앞당기지 않게 함께 본다. */
+    latest_rtt_ms: u64,
 
     /** @brief 연달아 데드라인을 넘긴 횟수. 다음 데드라인을 늘리는 데 쓴다. */
     pto_count: u32,
@@ -822,6 +852,7 @@ impl Connection {
             rttvar_ms: 166,
             have_rtt: false,
             min_rtt_ms: u64::MAX,
+            latest_rtt_ms: 0,
             pto_count: 0,
             cwnd: 10 * MAX_DATAGRAM as u64,
             ssthresh: u64::MAX,
@@ -853,7 +884,7 @@ impl Connection {
         scid: Vec<u8>,
         tp: TransportParams,
     ) -> Result<Self, QuicError> {
-        if !(1..=20).contains(&dcid.len()) || !(1..=20).contains(&scid.len()) {
+        if !(1..=20).contains(&dcid.len()) || scid.len() > 20 {
             return Err(QuicError::Frame);
         }
         let mut local_tp = normalize_local_transport_params(tp);
@@ -930,6 +961,7 @@ impl Connection {
             rttvar_ms: 166,
             have_rtt: false,
             min_rtt_ms: u64::MAX,
+            latest_rtt_ms: 0,
             pto_count: 0,
             cwnd: 10 * MAX_DATAGRAM as u64,
             ssthresh: u64::MAX,
@@ -977,6 +1009,9 @@ impl Connection {
     /** @brief 핸드셰이크가 내놓은 비밀로 그 수준의 키를 건다. */
     fn install_secrets(&mut self, sp: SecretPair) {
         let space = level_space(sp.level);
+        if self.spaces[space].discarded {
+            return;
+        }
         let (aead, klen) = suite_aead(sp.client.suite);
         let (send, recv) = match self.role {
             Role::Server => (&sp.server.secret, &sp.client.secret),
@@ -1088,7 +1123,12 @@ impl Connection {
             return;
         }
 
-        if self.spaces[HANDSHAKE].recv_keys.is_some() {
+        /*
+         * 서버의 Initial 을 처리한 뒤에는 Retry 를 받지 않는다. Initial 공간을 버린 뒤에는
+         * Handshake 키도 곧 버리므로 키가 있는지만 보면 끝난 연결이 Retry 로 처음부터 다시
+         * 시작한다.
+         */
+        if self.spaces[HANDSHAKE].recv_keys.is_some() || self.spaces[INITIAL].discarded {
             return;
         }
         let Some((scid, token)) = parse_retry(pkt) else {
@@ -1180,9 +1220,10 @@ impl Connection {
             }
         }
         for (level, data) in outs {
-            self.spaces[level_space(level)]
-                .out_crypto
-                .extend_from_slice(&data);
+            let space = &mut self.spaces[level_space(level)];
+            if !space.discarded {
+                space.out_crypto.extend_from_slice(&data);
+            }
         }
         if self.peer_tp.is_none() {
             if let Some(raw) = peer_tp {
@@ -1248,10 +1289,17 @@ impl Connection {
 
             self.key_update_allowed = true;
             if self.role == Role::Server {
+                /*
+                 * RFC 9001 에서 서버의 핸드셰이크는 끝나는 순간 확정된다. 클라이언트는 이
+                 * 서버가 보내는 HANDSHAKE_DONE 을 받아야 확정된다.
+                 */
+                self.handshake_confirmed = true;
                 self.out_frames_app.push(Frame::HandshakeDone);
-                // QUIC 서버는 TLS KeyUpdate를 쓰지 않고, NewSessionTicket을 포함한 출력과
-                // 핸드셰이크 결과는 위에서 모두 옮겼다. transcript·ClientHello·mTLS 인증서까지
-                // 든 상태 기계를 연결 유휴 수명 동안 남겨 둘 이유가 없다.
+                /*
+                 * QUIC 서버는 TLS KeyUpdate 를 쓰지 않고, NewSessionTicket 을 포함한 출력과
+                 * 핸드셰이크 결과는 위에서 모두 옮겼다. transcript, ClientHello, mTLS 인증서까지
+                 * 든 상태 기계를 연결 유휴 수명 동안 남겨 둘 이유가 없다.
+                 */
                 self.tls_server = None;
             }
             if self.role == Role::Client {
@@ -1342,6 +1390,16 @@ impl Connection {
                 if first & 0x40 == 0 {
                     break;
                 }
+                /*
+                 * 서버는 핸드셰이크를 끝내기 전에 1-RTT 패킷을 처리하지 않는다(RFC 9001). 이
+                 * 패킷에 확인을 보내면 클라이언트는 핸드셰이크가 확정됐다고 보고 Handshake 키를
+                 * 버릴 수 있다. 그 뒤 클라이언트의 Finished 를 잃으면 클라이언트는 그것을 다시
+                 * 보내지 않고, 서버는 핸드셰이크를 끝내지 못해 응답에 PTO 도 걸지 못한 채
+                 * 멈춘다. 버린 패킷은 핸드셰이크가 확정된 뒤 클라이언트가 다시 보낸다.
+                 */
+                if self.role == Role::Server && !self.handshake_complete {
+                    break;
+                }
                 let keys = match self.spaces[APP].recv_keys.clone() {
                     Some(k) => k,
                     None => break,
@@ -1382,15 +1440,25 @@ impl Connection {
                     self.handle_retry(rest);
                     break;
                 }
+                /*
+                 * 풀 수 없는 패킷은 길이만큼 건너뛰고 뒤에 합쳐진 패킷을 계속 처리한다. 버린
+                 * Initial 공간의 패킷 뒤에 Handshake 패킷이 붙어 오는 일이 흔하다.
+                 */
+                let Some(packet_len) = packet::long_packet_len(rest) else {
+                    break;
+                };
                 let space = match ptype_val {
                     ptype::INITIAL => INITIAL,
                     ptype::HANDSHAKE => HANDSHAKE,
 
                     ptype::ZERO_RTT if self.role == Role::Server => APP,
-                    _ => break,
+                    _ => {
+                        pos += packet_len;
+                        continue;
+                    }
                 };
 
-                if self.role == Role::Server && space == INITIAL && self.tls_server.is_none() {
+                if self.role == Role::Server && space == INITIAL && self.cfg_server.is_some() {
                     if let Some(dcid) = long_header_dcid(rest) {
                         self.initial_dcid = dcid.clone();
                         self.install_initial_keys(&dcid);
@@ -1405,23 +1473,19 @@ impl Connection {
                     }
                 }
                 let keys = if ptype_val == ptype::ZERO_RTT {
-                    match self.early_recv_keys.clone() {
-                        Some(k) => k,
-                        None => break,
-                    }
+                    self.early_recv_keys.clone()
                 } else {
-                    match self.spaces[space].recv_keys.clone() {
-                        Some(k) => k,
-                        None => break,
-                    }
+                    self.spaces[space].recv_keys.clone()
+                };
+                let Some(keys) = keys else {
+                    pos += packet_len;
+                    continue;
                 };
                 let largest = self.spaces[space].largest_recv.unwrap_or(0);
-                let lp = match packet::unprotect_long(keys.0, &keys.1, rest, largest) {
-                    Some(lp) => lp,
-                    None => {
-                        self.note_diagnostic(QuicDiagnostic::LongPacketProtection);
-                        break;
-                    }
+                let Some(lp) = packet::unprotect_long(keys.0, &keys.1, rest, largest) else {
+                    self.note_diagnostic(QuicDiagnostic::LongPacketProtection);
+                    pos += packet_len;
+                    continue;
                 };
                 pos += lp.consumed;
 
@@ -1437,8 +1501,48 @@ impl Connection {
                 self.process_packet_kind(space, lp.pn, &lp.payload, kind)?;
             }
         }
+        self.discard_finished_spaces();
         self.flush();
         Ok(())
+    }
+
+    /**
+     * @brief 더는 쓰지 않는 Initial 과 Handshake 공간을 RFC 9001 이 정한 시점에 버린다.
+     * @details 서버는 Handshake 패킷을 처음 처리하면 Initial 을 버린다. 핸드셰이크가 확정되면
+     *          양쪽 모두 Handshake 를 버린다. 클라이언트가 Initial 을 버리는 시점은 첫
+     *          Handshake 패킷을 보낼 때라 flush 가 맡는다.
+     */
+    fn discard_finished_spaces(&mut self) {
+        if self.role == Role::Server
+            && !self.spaces[INITIAL].discarded
+            && self.spaces[HANDSHAKE].largest_recv.is_some()
+        {
+            self.discard_space(INITIAL);
+        }
+        if self.handshake_confirmed {
+            for space in [INITIAL, HANDSHAKE] {
+                if !self.spaces[space].discarded {
+                    self.discard_space(space);
+                }
+            }
+        }
+    }
+
+    /**
+     * @brief 번호 공간 하나의 키와 복구 상태를 버린다.
+     * @details 남은 패킷은 확인도 손실 판정도 받지 않으므로 흐르는 양에서 빼고 PTO 횟수도
+     *          처음으로 돌린다. 그대로 두면 끝난 핸드셰이크의 재전송이 응용 데이터의 PTO 를
+     *          앞질러 차지한다.
+     */
+    fn discard_space(&mut self, space: usize) {
+        let dropped = std::mem::take(&mut self.spaces[space]);
+        let in_flight = dropped
+            .sent
+            .iter()
+            .fold(0u64, |sum, packet| sum.saturating_add(packet.size));
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(in_flight);
+        self.spaces[space].discarded = true;
+        self.pto_count = 0;
     }
 
     #[cfg(test)]
@@ -1532,6 +1636,12 @@ impl Connection {
                     if kind != PacketKind::OneRtt || self.role != Role::Client {
                         return Err(QuicError::Frame);
                     }
+                    /*
+                     * ACK 와 PADDING, CONNECTION_CLOSE 말고는 모두 확인을 끌어낸다. 이 프레임만
+                     * 담은 패킷에 답하지 않으면 서버는 그 패킷을 영영 확인받지 못해 PTO 가
+                     * 계속 커진다.
+                     */
+                    ack_eliciting = true;
                     self.handshake_confirmed = true;
                 }
                 Frame::ConnectionClose {
@@ -1949,8 +2059,17 @@ impl Connection {
         })
     }
 
-    /** @brief 긴 헤더 패킷 하나를 만든다. 핸드셰이크 중에 쓴다. */
-    fn build_long_packet(&mut self, space: usize, pad_to: usize) -> Option<Vec<u8>> {
+    /**
+     * @brief 긴 헤더 패킷 하나를 만든다. 핸드셰이크 중에 쓴다.
+     * @param probe 혼잡 윈도우가 막혀도 보낼 수 있는 남은 프로브 패킷 수. 윈도우를 넘겨
+     *              보냈으면 하나 줄인다.
+     */
+    fn build_long_packet(
+        &mut self,
+        space: usize,
+        pad_to: usize,
+        probe: &mut u8,
+    ) -> Option<Vec<u8>> {
         let (aead, keys) = self.spaces[space].send_keys.clone()?;
         let mut payload = Vec::new();
         let mut rtx_frames: Vec<Frame> = Vec::new();
@@ -1963,7 +2082,8 @@ impl Connection {
             self.spaces[space].ack_pending = false;
         }
 
-        if self.can_send_new() {
+        let window_open = self.can_send_new();
+        if window_open || *probe > 0 {
             append_queued_frames(
                 &mut self.spaces[space].rtx,
                 &mut payload,
@@ -2007,12 +2127,18 @@ impl Connection {
                 packet::protect_long(aead, &keys, ptype_val, &dcid, &scid, token, pn, 4, &payload);
         }
         self.spaces[space].next_pn += 1;
+        if ack_eliciting && !window_open {
+            *probe = probe.saturating_sub(1);
+        }
         self.track_sent(space, pn, ack_eliciting, pkt.len() as u64, rtx_frames);
         Some(pkt)
     }
 
-    /** @brief 짧은 헤더 패킷 하나를 만든다. 핸드셰이크 뒤에 쓴다. */
-    fn build_short_packet(&mut self) -> Option<Vec<u8>> {
+    /**
+     * @brief 짧은 헤더 패킷 하나를 만든다. 핸드셰이크 뒤에 쓴다.
+     * @param probe 혼잡 윈도우가 막혀도 보낼 수 있는 남은 프로브 패킷 수.
+     */
+    fn build_short_packet(&mut self, probe: &mut u8) -> Option<Vec<u8>> {
         let (aead, keys) = self.spaces[APP].send_keys.clone()?;
         let mut payload = Vec::new();
         let mut rtx_frames: Vec<Frame> = Vec::new();
@@ -2031,7 +2157,8 @@ impl Connection {
             frame::encode(&mut payload, &close);
         }
 
-        if self.can_send_new() {
+        let window_open = self.can_send_new();
+        if window_open || *probe > 0 {
             append_queued_frames(
                 &mut self.spaces[APP].rtx,
                 &mut payload,
@@ -2070,6 +2197,9 @@ impl Connection {
             &payload,
             self.send_key_phase,
         );
+        if ack_eliciting && !window_open {
+            *probe = probe.saturating_sub(1);
+        }
         self.track_sent(APP, pn, ack_eliciting, pkt.len() as u64, rtx_frames);
         Some(pkt)
     }
@@ -2088,6 +2218,7 @@ impl Connection {
         }
         self.bytes_in_flight += size;
         self.last_activity_ms = self.now_ms;
+        self.spaces[space].last_ack_eliciting_ms = self.now_ms;
         self.spaces[space].sent.push(SentPacket {
             pn,
             time_ms: self.now_ms,
@@ -2136,7 +2267,20 @@ impl Connection {
             }
         }
         self.spaces[space].sent = remaining;
-        if acked_bytes == 0 {
+        let state = &mut self.spaces[space];
+        let largest_advanced = state.largest_acked.is_none_or(|prev| largest > prev);
+        state.largest_acked = Some(
+            state
+                .largest_acked
+                .map_or(largest, |prev| prev.max(largest)),
+        );
+        /*
+         * ACK 만 담은 패킷은 기록하지 않으므로, 확인받은 바이트가 없어도 새로 확인된 패킷이
+         * 있을 수 있다. 가장 큰 확인 번호가 앞으로 갔다면 그렇다. 이때 손실 판정을 건너뛰면,
+         * 상대가 ACK 만 담은 패킷을 계속 확인해 줘도 그보다 앞서 잃은 패킷은 PTO 로만 다시
+         * 나가고 그 간격은 매번 두 배로 는다.
+         */
+        if acked_bytes == 0 && !largest_advanced {
             return Ok(());
         }
         self.bytes_in_flight = self.bytes_in_flight.saturating_sub(acked_bytes);
@@ -2159,52 +2303,129 @@ impl Connection {
         if congestion_acked_bytes > 0 {
             self.on_cc_ack(congestion_acked_bytes);
         }
-        self.detect_lost(space, largest);
+        self.detect_lost(space);
         Ok(())
     }
 
     /**
      * @brief 손실된 패킷을 찾아 다시 보낼 것을 표시한다.
-     * @details 확인된 것보다 충분히 앞선 패킷을 잃은 것으로 본다. 시간이 아니라 순서로
-     *          판정해야 왕복 시간이 큰 경로에서도 빨리 알아챈다.
+     * @details 확인된 가장 큰 번호보다 충분히 앞섰거나, 그보다 앞서 보냈고 왕복 시간의 9/8 이
+     *          지난 패킷을 잃은 것으로 본다. 아직 시간이 차지 않은 패킷은 그 시각을 loss_time_ms
+     *          에 남겨, 새 확인이 오지 않아도 on_timeout 이 그때 판정하게 한다.
      */
-    fn detect_lost(&mut self, space: usize, largest_acked: u64) {
-        /** @brief 이만큼 뒤의 패킷이 먼저 오면 잃은 것으로 본다. */
+    fn detect_lost(&mut self, space: usize) {
+        /** @brief 이만큼 뒤의 패킷이 먼저 확인되면 잃은 것으로 본다. */
         const PACKET_THRESHOLD: u64 = 3;
+        let Some(largest_acked) = self.spaces[space].largest_acked else {
+            return;
+        };
         let now = self.now_ms;
-        let loss_delay = (self.srtt_ms * 9 / 8).max(1);
+        let loss_delay = (self.srtt_ms.max(self.latest_rtt_ms) * 9 / 8).max(1);
         let sent = std::mem::take(&mut self.spaces[space].sent);
         let mut remaining = Vec::with_capacity(sent.len());
         let mut lost_frames = Vec::new();
         let mut lost_bytes = 0u64;
         let mut newest_lost_time = None;
+        let mut loss_time: Option<u64> = None;
         for sp in sent {
+            if sp.pn > largest_acked {
+                remaining.push(sp);
+                continue;
+            }
             let lost_by_pn = sp.pn + PACKET_THRESHOLD <= largest_acked;
-            let lost_by_time = sp.pn < largest_acked && now.saturating_sub(sp.time_ms) > loss_delay;
+            let lost_by_time = now.saturating_sub(sp.time_ms) >= loss_delay;
             if lost_by_pn || lost_by_time {
                 lost_bytes += sp.size;
                 newest_lost_time =
                     Some(newest_lost_time.map_or(sp.time_ms, |t: u64| t.max(sp.time_ms)));
                 lost_frames.extend(sp.frames);
             } else {
+                let due = sp.time_ms.saturating_add(loss_delay);
+                loss_time = Some(loss_time.map_or(due, |t| t.min(due)));
                 remaining.push(sp);
             }
         }
         self.spaces[space].sent = remaining;
-        if !lost_frames.is_empty() {
-            self.spaces[space].rtx.extend(lost_frames);
-            self.bytes_in_flight = self.bytes_in_flight.saturating_sub(lost_bytes);
-            if newest_lost_time.is_some_and(|lost_time| {
-                self.recovery_start_ms
-                    .is_none_or(|recovery_start| lost_time > recovery_start)
-            }) {
-                self.on_cc_loss();
-                self.recovery_start_ms = Some(now);
-            }
+        self.spaces[space].loss_time_ms = loss_time;
+        /*
+         * 프레임이 없는 패킷도 흐르는 양에는 들어 있다. PING 만 실었거나 PTO 가 프레임을
+         * 이미 옮겨 간 패킷이 그렇다. 프레임 유무로 거르면 그 크기가 영영 빠지지 않아 혼잡
+         * 윈도우가 닫힌 채로 남는다.
+         */
+        if lost_bytes == 0 {
+            return;
+        }
+        self.spaces[space].rtx.extend(lost_frames);
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(lost_bytes);
+        if newest_lost_time.is_some_and(|lost_time| {
+            self.recovery_start_ms
+                .is_none_or(|recovery_start| lost_time > recovery_start)
+        }) {
+            self.on_cc_loss();
+            self.recovery_start_ms = Some(now);
         }
     }
 
-    /** @brief 데드라인이 지났을 때 다시 보내거나 연결을 닫는다. */
+    /**
+     * @brief 이 공간에 PTO 를 걸어야 하는지.
+     * @details 확인을 기다리는 패킷이 있어야 한다. 응용 데이터 공간은 핸드셰이크가 확정된
+     *          뒤에만 건다. 그 전에는 상대에게 그 패킷을 풀 키가 없거나 이쪽에 확인을 풀 키가
+     *          없을 수 있다.
+     */
+    fn pto_armed(&self, space: usize) -> bool {
+        !self.spaces[space].sent.is_empty() && (space != APP || self.handshake_confirmed)
+    }
+
+    /** @brief PTO 가 걸린 공간들 가운데 가장 이른 데드라인. */
+    fn pto_deadline(&self) -> Option<u64> {
+        let period = self.pto_ms();
+        [INITIAL, HANDSHAKE, APP]
+            .into_iter()
+            .filter(|&space| self.pto_armed(space))
+            .map(|space| {
+                self.spaces[space]
+                    .last_ack_eliciting_ms
+                    .saturating_add(period)
+            })
+            .min()
+    }
+
+    /**
+     * @brief 이 공간에서 확인받지 못한 프레임을 오래된 것부터 프로브가 실을 만큼 다시 보낼
+     *        차례에 넣는다.
+     * @details 가장 오래된 패킷 하나만 다시 보내면, 확인받지 못한 패킷이 여럿일 때 PTO 마다
+     *          하나씩 돌아가며 보내게 되고 간격은 매번 두 배로 는다. 그 사이 한쪽 사본만 계속
+     *          잃으면 그 데이터는 끝내 가지 않는다. 반대로 전부 옮기면 꼬리 하나를 잃어도 PTO
+     *          한 번에 윈도우 전체를 다시 보낸다. 나머지는 프로브의 확인이 오면 손실 판정이
+     *          맡는다. 원래 패킷은 확인과 왕복 시간 측정에 쓰도록 남겨 두고 프레임만 옮긴다.
+     *          다시 보낼 것이 없으면 PING 을 보낸다.
+     */
+    fn queue_probe(&mut self, space: usize) {
+        let state = &mut self.spaces[space];
+        let mut budget = usize::from(PROBE_PACKETS) * MAX_PACKET_PAYLOAD;
+        let mut requeued = false;
+        for packet in state
+            .sent
+            .iter_mut()
+            .filter(|packet| !packet.frames.is_empty())
+        {
+            let size = usize::try_from(packet.size).unwrap_or(usize::MAX);
+            if requeued && size > budget {
+                break;
+            }
+            budget = budget.saturating_sub(size);
+            state.rtx.extend(std::mem::take(&mut packet.frames));
+            requeued = true;
+        }
+        if state.rtx.is_empty() {
+            state.rtx.push(Frame::Ping);
+        }
+    }
+
+    /**
+     * @brief 시각을 넘겨 손실 판정과 PTO 를 돌리고 유휴 데드라인이 지나면 닫는다.
+     * @return 연결이 닫혔거나 기다리는 데드라인이 없으면 false.
+     */
     pub fn on_timeout(&mut self, now_ms: u64) -> bool {
         self.now_ms = now_ms;
         let peer_idle = self.peer_tp.as_ref().map_or(0, |tp| tp.max_idle_timeout);
@@ -2221,35 +2442,39 @@ impl Connection {
             return false;
         }
 
-        let mut oldest: Option<(usize, u64)> = None;
-        for s in 0..3 {
-            for sp in &self.spaces[s].sent {
-                if sp.ack_eliciting && oldest.is_none_or(|(_, t)| sp.time_ms < t) {
-                    oldest = Some((s, sp.time_ms));
-                }
+        let mut lost_by_time = false;
+        for space in [INITIAL, HANDSHAKE, APP] {
+            if self.spaces[space]
+                .loss_time_ms
+                .is_some_and(|due| due <= now_ms)
+            {
+                self.detect_lost(space);
+                lost_by_time = true;
             }
         }
-        let Some((s, t)) = oldest else {
+        if lost_by_time {
+            self.flush();
+            return true;
+        }
+
+        let Some(deadline) = self.pto_deadline() else {
             return false;
         };
-        if now_ms.saturating_sub(t) >= self.pto_ms() {
-            let oldest = self.spaces[s]
-                .sent
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, packet)| packet.time_ms)
-                .map(|(index, _)| index)
-                .expect("앞에서 가장 오래된 패킷을 확인했습니다");
-            let sp = self.spaces[s].sent.remove(oldest);
-            self.bytes_in_flight = self.bytes_in_flight.saturating_sub(sp.size);
-            if sp.frames.is_empty() {
-                self.spaces[s].rtx.push(Frame::Ping);
-            } else {
-                self.spaces[s].rtx.extend(sp.frames);
-            }
-            self.pto_count = (self.pto_count + 1).min(8);
-            self.flush();
+        if now_ms < deadline {
+            return true;
         }
+        /*
+         * RFC 9002 는 PTO 가 난 공간 말고도 확인을 기다리는 다른 공간에 함께 프로브를
+         * 보내라고 권한다. 핸드셰이크 중 Initial 과 Handshake 가 함께 남아 있을 때, 한쪽 PTO 가
+         * 횟수를 올려 다른 쪽 데드라인까지 두 배로 밀어내지 않게 한다.
+         */
+        for space in [INITIAL, HANDSHAKE, APP] {
+            if self.pto_armed(space) {
+                self.queue_probe(space);
+            }
+        }
+        self.pto_count = (self.pto_count + 1).min(8);
+        self.flush_packets(PROBE_PACKETS);
         true
     }
 
@@ -2449,6 +2674,7 @@ impl Connection {
     /** @brief 왕복 시간 표본을 반영한다. 상대가 알린 확인 지연을 빼고 측정한다. */
     fn update_rtt(&mut self, sample_ms: u64, ack_delay_ms: u64) {
         let sample = sample_ms.max(1);
+        self.latest_rtt_ms = sample;
         self.min_rtt_ms = self.min_rtt_ms.min(sample);
         let adjusted = if sample > self.min_rtt_ms.saturating_add(ack_delay_ms) {
             sample - ack_delay_ms
@@ -2543,11 +2769,21 @@ impl Connection {
 
     /** @brief 보낼 것들을 패킷으로 묶어 내보낼 큐에 넣는다. */
     fn flush(&mut self) {
+        self.flush_packets(0);
+    }
+
+    /**
+     * @brief 보낼 것들을 패킷으로 묶어 내보낼 큐에 넣는다.
+     * @param probe 혼잡 윈도우를 넘겨서라도 보낼 수 있는 패킷 수. PTO 프로브만 0 이 아닌 값을
+     *              준다. 프로브가 윈도우에 막히면, 윈도우는 확인이 와야 열리는데 확인은 프로브가
+     *              가야 오므로 회복이 멈춘다.
+     */
+    fn flush_packets(&mut self, mut probe: u8) {
         if self.closed {
             return;
         }
         self.schedule_pending_stream_sends();
-        // (짧은 머리말인지, Initial 인지, 바이트)
+        /* 짧은 헤더인지, Initial 인지, 패킷 바이트. */
         let mut packets: Vec<(bool, bool, Vec<u8>)> = Vec::new();
 
         let pad = if self.role == Role::Client && self.spaces[INITIAL].next_pn == 0 {
@@ -2556,7 +2792,7 @@ impl Connection {
             0
         };
         let mut client_first_flight = false;
-        if let Some(p) = self.build_long_packet(INITIAL, pad) {
+        if let Some(p) = self.build_long_packet(INITIAL, pad, &mut probe) {
             client_first_flight = pad > 0;
             packets.push((false, true, p));
         }
@@ -2564,18 +2800,29 @@ impl Connection {
         while let Some(p) = self.build_zero_rtt_packet() {
             packets.push((false, false, p));
         }
-        while let Some(p) = self.build_long_packet(HANDSHAKE, 0) {
+        let mut sent_handshake = false;
+        while let Some(p) = self.build_long_packet(HANDSHAKE, 0, &mut probe) {
+            sent_handshake = true;
             packets.push((false, false, p));
         }
-        while let Some(p) = self.build_short_packet() {
+        /*
+         * RFC 9001 에서 클라이언트는 Handshake 패킷을 처음 보낼 때 Initial 을 버린다. 이미 만든
+         * Initial 패킷은 이 데이터그램에 함께 나간다.
+         */
+        if sent_handshake && self.role == Role::Client && !self.spaces[INITIAL].discarded {
+            self.discard_space(INITIAL);
+        }
+        while let Some(p) = self.build_short_packet(&mut probe) {
             packets.push((true, false, p));
         }
         if packets.is_empty() {
             return;
         }
 
-        // RFC 9000: Initial 을 담은 데이터그램은 1200바이트 이상이어야 한다. 받는 쪽은
-        // 그보다 작은 것을 버려도 되므로, 채우지 않으면 상대에 따라 핸드셰이크가 조용히 멈춘다.
+        /*
+         * RFC 9000 에서 Initial 을 담은 데이터그램은 1200바이트 이상이어야 한다. 받는 쪽은
+         * 그보다 작은 것을 버려도 되므로, 채우지 않으면 상대에 따라 핸드셰이크가 조용히 멈춘다.
+         */
         let mut dg = Vec::new();
         let mut dg_has_initial = false;
         for (is_short, is_initial, p) in packets {
@@ -3046,7 +3293,11 @@ impl Connection {
         self.handshake_complete
     }
 
-    /** @brief 핸드셰이크 완료가 상대에게 확인됐는지. 키 갱신은 이 뒤에만 된다. */
+    /**
+     * @brief 핸드셰이크가 확정됐는지.
+     * @details 서버는 핸드셰이크가 끝나는 순간, 클라이언트는 HANDSHAKE_DONE 을 받았을 때
+     *          확정된다.
+     */
     pub fn is_handshake_confirmed(&self) -> bool {
         self.handshake_confirmed
     }
@@ -3775,6 +4026,74 @@ mod tests {
 
         assert!(server.peer_transport_params().is_some());
         assert!(client.peer_transport_params().is_some());
+    }
+
+    #[test]
+    /**
+     * @brief 서버가 핸드셰이크를 끝내기 전에 온 1-RTT 패킷을 처리하지도 확인하지도 않는지.
+     * @details 확인을 보내면 클라이언트는 그것으로 핸드셰이크가 확정됐다고 보고 Handshake 키를
+     *          버릴 수 있다. 그 뒤 클라이언트의 Finished 를 잃으면 어느 쪽도 다시 보내지 않아
+     *          연결이 멈춘다. 버린 질의는 핸드셰이크가 확정된 뒤 클라이언트가 다시 보낸다.
+     */
+    fn server_ignores_one_rtt_before_handshake_completes() {
+        let mut server = Connection::new_server(
+            server_cfg(vec![b"doq".to_vec()]),
+            b"SERVERID".to_vec(),
+            TransportParams::server_defaults(),
+        );
+        let mut client = Connection::new_client(
+            client_cfg(vec![b"doq".to_vec()]),
+            b"INITDCID".to_vec(),
+            b"CLIENTID".to_vec(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        while let Some(datagram) = client.next_datagram() {
+            server.recv_datagram(&datagram).unwrap();
+        }
+        while let Some(datagram) = server.next_datagram() {
+            client.recv_datagram(&datagram).unwrap();
+        }
+        assert!(client.is_handshake_complete());
+        let finished: Vec<Vec<u8>> = std::iter::from_fn(|| client.next_datagram()).collect();
+        assert!(
+            !finished.is_empty(),
+            "클라이언트가 Finished 를 보내야 합니다"
+        );
+
+        client.send_dns_message(0, b"\x00\x00 QUERY").unwrap();
+        let early: Vec<Vec<u8>> = std::iter::from_fn(|| client.next_datagram()).collect();
+        assert!(
+            !early.is_empty() && early.iter().all(|datagram| datagram[0] & 0x80 == 0),
+            "질의가 1-RTT 패킷으로만 나가야 이 시험이 의미가 있습니다"
+        );
+        for datagram in &early {
+            server.recv_datagram(datagram).unwrap();
+        }
+        assert!(!server.is_handshake_complete());
+        assert!(
+            server.take_stream_requests().is_empty(),
+            "핸드셰이크를 끝내기 전에 1-RTT 질의를 처리했습니다"
+        );
+        assert!(
+            server.next_datagram().is_none(),
+            "핸드셰이크를 끝내기 전에 1-RTT 패킷에 답했습니다"
+        );
+
+        for datagram in &finished {
+            server.recv_datagram(datagram).unwrap();
+        }
+        pump(&mut client, &mut server);
+        assert!(server.is_handshake_complete() && client.is_handshake_confirmed());
+        client.on_timeout(5_000);
+        while let Some(datagram) = client.next_datagram() {
+            server.recv_datagram(&datagram).unwrap();
+        }
+        assert_eq!(
+            server.take_stream_requests().len(),
+            1,
+            "버린 질의가 다시 오지 않았습니다"
+        );
     }
 
     #[test]
@@ -5096,8 +5415,13 @@ mod tests {
             size: 1000,
             frames: vec![Frame::Ping],
         });
-        conn.detect_lost(APP, 3);
+        conn.spaces[APP].largest_acked = Some(3);
+        conn.detect_lost(APP);
         let once = conn.cwnd;
+        assert!(
+            once < 16 * MAX_DATAGRAM as u64,
+            "첫 손실에 윈도우가 줄어야 합니다"
+        );
 
         conn.now_ms = 201;
         conn.spaces[APP].sent.push(SentPacket {
@@ -5107,9 +5431,438 @@ mod tests {
             size: 1000,
             frames: vec![Frame::Ping],
         });
-        conn.detect_lost(APP, 4);
+        conn.spaces[APP].largest_acked = Some(4);
+        conn.detect_lost(APP);
 
         assert_eq!(conn.cwnd, once);
+    }
+
+    /** @brief 핸드셰이크를 끝낸 DoQ 클라이언트와 서버. */
+    fn established_doq_pair() -> (Connection, Connection) {
+        let mut server = Connection::new_server(
+            server_cfg(vec![b"doq".to_vec()]),
+            b"SERVERID".to_vec(),
+            TransportParams::server_defaults(),
+        );
+        let mut client = Connection::new_client(
+            client_cfg(vec![b"doq".to_vec()]),
+            b"INITDCID".to_vec(),
+            b"CLIENTID".to_vec(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        pump(&mut client, &mut server);
+        assert!(client.is_handshake_confirmed() && server.is_handshake_complete());
+        (client, server)
+    }
+
+    /** @brief 클라이언트가 보낸 질의를 서버가 받고, 서버의 확인까지 클라이언트에 전한다. */
+    fn deliver_query(client: &mut Connection, server: &mut Connection, stream: u64) {
+        client.send_dns_message(stream, b"\x00\x00 QUERY").unwrap();
+        while let Some(dg) = client.next_datagram() {
+            server.recv_datagram(&dg).unwrap();
+        }
+        assert_eq!(server.take_stream_requests().len(), 1);
+        while let Some(dg) = server.next_datagram() {
+            client.recv_datagram(&dg).unwrap();
+        }
+    }
+
+    #[test]
+    /**
+     * @brief HANDSHAKE_DONE 만 담은 패킷에도 클라이언트가 확인을 보내는지.
+     * @details 답하지 않으면 서버는 그 패킷을 영영 확인받지 못한다. 서버가 기다리는 확인이
+     *          오지 않으니 PTO 는 계속 두 배로 늘고, 그 뒤에 잃은 응답을 알아챌 길도 없다.
+     */
+    fn handshake_done_alone_is_acknowledged() {
+        let (mut client, mut server) = established_doq_pair();
+        server.out_frames_app.push(Frame::HandshakeDone);
+        server.flush();
+        let datagram = server.next_datagram().expect("HANDSHAKE_DONE 데이터그램");
+        assert_eq!(server.spaces[APP].sent.len(), 1);
+
+        client.recv_datagram(&datagram).unwrap();
+        let ack = client
+            .next_datagram()
+            .expect("HANDSHAKE_DONE 을 받고도 확인을 보내지 않았습니다");
+        server.recv_datagram(&ack).unwrap();
+        assert!(server.spaces[APP].sent.is_empty());
+    }
+
+    #[test]
+    /**
+     * @brief ACK 만 담은 패킷을 확인받아도 그보다 앞서 잃은 패킷을 손실로 판정하는지.
+     * @details ACK 만 담은 패킷은 기록하지 않으므로 이 확인이 알려 주는 바이트는 없다. 그렇다고
+     *          판정을 건너뛰면 상대가 그런 패킷을 계속 확인해 줘도 잃은 데이터는 PTO 로만 다시
+     *          나간다. 핸드셰이크 중 ServerHello 를 잃으면 클라이언트는 같은 Initial 을 거듭
+     *          보내며 서버의 ACK 를 확인해 주는데, 서버는 그 사이 PTO 만 기다리다 멈췄다.
+     */
+    fn ack_of_ack_only_packets_detects_earlier_loss() {
+        let (mut client, mut server) = established_doq_pair();
+        deliver_query(&mut client, &mut server, 0);
+
+        server.set_now(1_000);
+        server.send_dns_message(0, b"\x00\x00 RESPONSE").unwrap();
+        while server.next_datagram().is_some() {}
+        let lost = server.spaces[APP].sent.last().expect("응답 패킷").pn;
+
+        for _ in 0..3 {
+            client.out_frames_app.push(Frame::Ping);
+            client.flush();
+            while let Some(datagram) = client.next_datagram() {
+                server.recv_datagram(&datagram).unwrap();
+            }
+            while server.next_datagram().is_some() {}
+        }
+        let largest = server.spaces[APP].next_pn - 1;
+        assert!(
+            server.spaces[APP]
+                .sent
+                .iter()
+                .all(|packet| packet.pn <= lost),
+            "PING 에 대한 답은 ACK 만 담아야 이 시험이 의미가 있습니다"
+        );
+        assert!(lost + 3 <= largest);
+
+        let mut ack = Vec::new();
+        frame::encode(
+            &mut ack,
+            &Frame::Ack {
+                largest,
+                delay: 0,
+                first_range: largest - lost - 1,
+                ranges: Vec::new(),
+            },
+        );
+        server.process_packet(APP, 1_000, &ack).unwrap();
+        server.flush();
+        while let Some(datagram) = server.next_datagram() {
+            client.recv_datagram(&datagram).unwrap();
+        }
+        let responses = client.take_stream_requests();
+        assert_eq!(
+            responses.len(),
+            1,
+            "PTO 전에 잃은 응답을 다시 보내지 않았습니다"
+        );
+        assert_eq!(responses[0].1, b"\x00\x00 RESPONSE");
+    }
+
+    #[test]
+    /**
+     * @brief 첫 PTO 프로브가 가장 오래된 패킷 뒤의 데이터까지 싣는지.
+     * @details 서버가 HANDSHAKE_DONE 과 응답을 따로 보냈고 둘 다 잃은 상태다. 프로브마다 가장
+     *          오래된 패킷 하나만 실으면 응답 사본은 PTO 한 번 걸러 나가고 간격은 두 배씩 늘어,
+     *          그 사본만 계속 잃으면 아무것도 보내지 않는 클라이언트는 응답을 끝내 받지 못한다.
+     */
+    fn first_probe_carries_data_behind_the_oldest_packet() {
+        let (mut client, mut server) = established_doq_pair();
+        deliver_query(&mut client, &mut server, 0);
+
+        server.set_now(1_000);
+        server.out_frames_app.push(Frame::HandshakeDone);
+        server.flush();
+        server.send_dns_message(0, b"\x00\x00 RESPONSE").unwrap();
+        let lost: Vec<Vec<u8>> = std::iter::from_fn(|| server.next_datagram()).collect();
+        assert_eq!(
+            lost.len(),
+            2,
+            "HANDSHAKE_DONE 과 응답이 따로 나가야 이 모양이 됩니다"
+        );
+
+        server.on_timeout(1_000 + server.base_pto_ms());
+        let probes: Vec<Vec<u8>> = std::iter::from_fn(|| server.next_datagram()).collect();
+        assert!(!probes.is_empty(), "PTO 에 프로브가 나가야 합니다");
+        for datagram in &probes {
+            client.recv_datagram(datagram).unwrap();
+        }
+        let responses = client.take_stream_requests();
+        assert_eq!(responses.len(), 1, "첫 프로브가 응답을 싣지 않았습니다");
+        assert_eq!(responses[0].1, b"\x00\x00 RESPONSE");
+    }
+
+    #[test]
+    /**
+     * @brief PTO 가 프로브에 실을 만큼만 다시 보낼 차례에 넣는지.
+     * @details 확인받지 못한 프레임을 전부 옮기면 꼬리 하나를 잃어도 PTO 한 번에 윈도우 전체를
+     *          다시 보낸다. 나머지는 프로브가 확인받은 뒤 손실 판정이 골라 다시 보낸다.
+     */
+    fn pto_requeues_only_what_its_probes_carry() {
+        let (mut client, mut server) = established_doq_pair();
+        deliver_query(&mut client, &mut server, 0);
+
+        server.set_now(1_000);
+        server.send_dns_message(0, &[0x5a; 8_000]).unwrap();
+        while server.next_datagram().is_some() {}
+        let carrying = |conn: &Connection| {
+            conn.spaces[APP]
+                .sent
+                .iter()
+                .filter(|packet| packet.time_ms == 1_000 && !packet.frames.is_empty())
+                .count()
+        };
+        let outstanding = carrying(&server);
+        assert!(
+            outstanding > 2 * usize::from(PROBE_PACKETS),
+            "프로브보다 훨씬 많은 패킷이 남아 있어야 이 시험이 의미가 있습니다"
+        );
+
+        server.on_timeout(1_000 + server.base_pto_ms());
+        let requeued = outstanding - carrying(&server);
+        assert!(
+            (1..=usize::from(PROBE_PACKETS)).contains(&requeued),
+            "PTO 가 원래 패킷 {requeued}개의 프레임을 옮겼습니다"
+        );
+    }
+
+    #[test]
+    /**
+     * @brief 다음 PTO 가 마지막 프로브를 보낸 때부터 두 배를 기다리는지.
+     * @details 원래 패킷은 확인을 받으려고 남겨 두므로, 가장 오래된 패킷의 나이로 재면 프로브를
+     *          보낸 직후에도 데드라인이 이미 지나 있어 PTO 마다 프로브가 몰려 나간다.
+     */
+    fn next_pto_waits_twice_as_long_after_the_latest_probe() {
+        let (mut client, mut server) = established_doq_pair();
+        deliver_query(&mut client, &mut server, 0);
+
+        server.set_now(1_000);
+        server.send_dns_message(0, b"\x00\x00 RESPONSE").unwrap();
+        while server.next_datagram().is_some() {}
+
+        let base = server.base_pto_ms();
+        let first_probe_at = 1_000 + base;
+        server.on_timeout(first_probe_at - 1);
+        assert!(
+            server.next_datagram().is_none(),
+            "PTO 가 너무 일찍 났습니다"
+        );
+        server.on_timeout(first_probe_at);
+        assert!(
+            server.next_datagram().is_some(),
+            "첫 PTO 에 프로브가 나가야 합니다"
+        );
+        while server.next_datagram().is_some() {}
+
+        server.on_timeout(first_probe_at + 2 * base - 1);
+        assert!(
+            server.next_datagram().is_none(),
+            "다음 PTO 는 마지막 프로브로부터 두 배를 기다려야 합니다"
+        );
+        server.on_timeout(first_probe_at + 2 * base);
+        let probes: Vec<Vec<u8>> = std::iter::from_fn(|| server.next_datagram()).collect();
+        assert!(!probes.is_empty(), "두 번째 PTO 에 프로브가 나가야 합니다");
+        for datagram in &probes {
+            client.recv_datagram(datagram).unwrap();
+        }
+        assert_eq!(client.take_stream_requests().len(), 1);
+    }
+
+    #[test]
+    /**
+     * @brief 혼잡 윈도우가 차 있어도 PTO 프로브가 나가는지.
+     * @details PTO 는 원래 패킷을 흐르는 양에 남겨 둔다. 프로브까지 윈도우에 막히면 윈도우는
+     *          확인이 와야 열리는데 확인은 프로브가 가야 오므로 회복이 멈춘다.
+     */
+    fn probe_is_sent_when_congestion_window_is_full() {
+        let (mut client, mut server) = established_doq_pair();
+        deliver_query(&mut client, &mut server, 0);
+
+        server.set_now(1_000);
+        server.send_dns_message(0, b"\x00\x00 RESPONSE").unwrap();
+        while server.next_datagram().is_some() {}
+        server.bytes_in_flight = server.cwnd;
+        assert!(!server.can_send_new());
+
+        server.on_timeout(1_000 + server.base_pto_ms());
+        let probes: Vec<Vec<u8>> = std::iter::from_fn(|| server.next_datagram()).collect();
+        assert!(
+            !probes.is_empty(),
+            "윈도우가 찼다고 프로브를 보내지 않았습니다"
+        );
+        for datagram in &probes {
+            client.recv_datagram(datagram).unwrap();
+        }
+        assert_eq!(client.take_stream_requests().len(), 1);
+    }
+
+    #[test]
+    /**
+     * @brief 시간 기준 손실을 새 확인 없이 타이머로 판정하는지.
+     * @details 뒤에 보낸 패킷이 확인됐지만 앞의 패킷이 아직 시간 기준에 못 미치면, 그 시각에
+     *          다시 확인해야 한다. 판정을 확인이 올 때만 하면 다음 확인이 없는 한 PTO 까지
+     *          기다리게 된다.
+     */
+    fn time_threshold_loss_fires_without_another_ack() {
+        let (mut client, mut server) = established_doq_pair();
+        deliver_query(&mut client, &mut server, 0);
+        deliver_query(&mut client, &mut server, 4);
+        server.srtt_ms = 80;
+        server.latest_rtt_ms = 80;
+        server.rttvar_ms = 0;
+
+        server.set_now(1_000);
+        server.send_dns_message(0, b"\x00\x00 FIRST").unwrap();
+        while server.next_datagram().is_some() {}
+        server.set_now(1_010);
+        server.send_dns_message(4, b"\x00\x00 SECOND").unwrap();
+        while let Some(datagram) = server.next_datagram() {
+            client.recv_datagram(&datagram).unwrap();
+        }
+        server.set_now(1_020);
+        while let Some(datagram) = client.next_datagram() {
+            server.recv_datagram(&datagram).unwrap();
+        }
+        while server.next_datagram().is_some() {}
+
+        let due = server.spaces[APP]
+            .loss_time_ms
+            .expect("시간 기준을 기다리는 패킷에 판정 시각이 걸려야 합니다");
+        assert!(
+            due < server.pto_deadline().expect("PTO 데드라인"),
+            "손실 판정이 PTO 보다 먼저 와야 이 시험이 의미가 있습니다"
+        );
+        server.on_timeout(due - 1);
+        assert!(server.next_datagram().is_none());
+
+        server.on_timeout(due);
+        let resent: Vec<Vec<u8>> = std::iter::from_fn(|| server.next_datagram()).collect();
+        assert!(!resent.is_empty(), "판정 시각에 다시 보내지 않았습니다");
+        for datagram in &resent {
+            client.recv_datagram(datagram).unwrap();
+        }
+        let responses = client.take_stream_requests();
+        assert!(responses
+            .iter()
+            .any(|(stream, body)| *stream == 0 && body == b"\x00\x00 FIRST"));
+    }
+
+    #[test]
+    /**
+     * @brief 핸드셰이크가 확정되면 양쪽이 Initial 과 Handshake 공간을 버리는지.
+     * @details 남겨 두면 끝난 핸드셰이크의 재전송이 응용 데이터보다 먼저 PTO 를 차지하고,
+     *          키와 재조립 버퍼가 연결 수명 내내 메모리에 남는다.
+     */
+    fn confirmed_handshake_discards_initial_and_handshake_spaces() {
+        let (client, server) = established_doq_pair();
+        for conn in [&client, &server] {
+            for space in [INITIAL, HANDSHAKE] {
+                let state = &conn.spaces[space];
+                assert!(state.discarded, "{:?} 쪽 {space} 공간", conn.role);
+                assert!(state.send_keys.is_none() && state.recv_keys.is_none());
+                assert!(state.sent.is_empty() && state.rtx.is_empty());
+            }
+            let app_in_flight: u64 = conn.spaces[APP].sent.iter().map(|packet| packet.size).sum();
+            assert_eq!(conn.bytes_in_flight, app_in_flight);
+        }
+    }
+
+    #[test]
+    /** @brief 늦게 온 Initial 이 버린 키를 되살리지 않는지. */
+    fn late_initial_does_not_restore_discarded_keys() {
+        let mut server = Connection::new_server(
+            server_cfg(vec![b"doq".to_vec()]),
+            b"SERVERID".to_vec(),
+            TransportParams::server_defaults(),
+        );
+        let mut client = Connection::new_client(
+            client_cfg(vec![b"doq".to_vec()]),
+            b"INITDCID".to_vec(),
+            b"CLIENTID".to_vec(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        let first_flight = client.next_datagram().expect("첫 Initial");
+        server.recv_datagram(&first_flight).unwrap();
+        pump(&mut client, &mut server);
+        assert!(server.spaces[INITIAL].discarded);
+
+        server.recv_datagram(&first_flight).unwrap();
+        assert!(server.spaces[INITIAL].recv_keys.is_none());
+        assert!(server.spaces[INITIAL].send_keys.is_none());
+        assert!(!server.is_closed());
+        assert!(server.next_datagram().is_none());
+    }
+
+    #[test]
+    /**
+     * @brief 풀 수 없는 긴 헤더 패킷 뒤에 합쳐진 패킷을 계속 처리하는지.
+     * @details Initial 공간을 버린 뒤에도 상대는 Initial 과 다른 패킷을 한 데이터그램에 합쳐
+     *          보낼 수 있다. 앞 패킷에서 처리를 멈추면 뒤에 붙은 패킷까지 잃는다.
+     */
+    fn packet_after_undecryptable_long_packet_is_processed() {
+        let (mut client, mut server) = established_doq_pair();
+        deliver_query(&mut client, &mut server, 0);
+        server.send_dns_message(0, b"\x00\x00 RESPONSE").unwrap();
+        let response = server.next_datagram().expect("응답 데이터그램");
+
+        let stale_keys = derive_packet_keys(&[9; 32], 16);
+        let mut datagram = packet::protect_long(
+            Aead::Aes128Gcm,
+            &stale_keys,
+            ptype::INITIAL,
+            b"CLIENTID",
+            b"SERVERID",
+            &[],
+            7,
+            4,
+            &[0u8; 40],
+        );
+        datagram.extend_from_slice(&response);
+        client.recv_datagram(&datagram).unwrap();
+
+        let responses = client.take_stream_requests();
+        assert_eq!(responses.len(), 1, "앞의 Initial 에서 처리를 멈췄습니다");
+    }
+
+    #[test]
+    /**
+     * @brief 핸드셰이크가 끝난 클라이언트가 Retry 를 무시하는지.
+     * @details Handshake 키를 버린 뒤에도 Retry 를 받으면 연결이 ClientHello 부터 다시
+     *          시작한다. RFC 9000 은 서버의 Initial 을 처리한 뒤의 Retry 를 버리게 한다.
+     */
+    fn retry_after_handshake_is_ignored() {
+        let (mut client, _server) = established_doq_pair();
+        let remote_before = client.remote_connection_id().to_vec();
+        let retry = crate::retry::build_retry(b"INITDCID", b"CLIENTID", b"NEWSCID1", b"token");
+
+        client.recv_datagram(&retry).unwrap();
+        assert_eq!(client.remote_connection_id(), remote_before.as_slice());
+        assert!(client.spaces[INITIAL].send_keys.is_none());
+        assert!(client.next_datagram().is_none());
+        assert!(!client.is_closed());
+    }
+
+    #[test]
+    /**
+     * @brief 길이 0인 연결 식별자를 쓰는 클라이언트와 질의를 주고받는지.
+     * @details 서버는 그런 클라이언트에게 목적지 식별자 없이 짧은 헤더 패킷을 보내고, 전송
+     *          파라미터의 initial_source_connection_id 도 길이 0으로 맞춰 본다.
+     */
+    fn client_with_zero_length_connection_id_exchanges_query() {
+        let mut server = Connection::new_server(
+            server_cfg(vec![b"doq".to_vec()]),
+            b"SERVERID".to_vec(),
+            TransportParams::server_defaults(),
+        );
+        let mut client = Connection::new_client(
+            client_cfg(vec![b"doq".to_vec()]),
+            b"INITDCID".to_vec(),
+            Vec::new(),
+            TransportParams::server_defaults(),
+        )
+        .unwrap();
+        pump(&mut client, &mut server);
+        assert!(client.is_handshake_confirmed() && server.is_handshake_complete());
+        assert!(server.remote_cid.is_empty());
+
+        deliver_query(&mut client, &mut server, 0);
+        server.send_dns_message(0, b"\x00\x00 RESPONSE").unwrap();
+        while let Some(datagram) = server.next_datagram() {
+            client.recv_datagram(&datagram).unwrap();
+        }
+        let responses = client.take_stream_requests();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].1, b"\x00\x00 RESPONSE");
     }
 
     #[test]

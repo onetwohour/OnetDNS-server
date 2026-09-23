@@ -3,6 +3,7 @@ use std::net::{Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use onetdns_core::udp::RecvWait;
 use onetdns_quic::params::TransportParams;
 use onetdns_quic::{Connection, QuicError};
 use onetdns_tls::{ClientConfig, TlsSession, TrustStore};
@@ -234,6 +235,18 @@ pub(crate) fn client_tls_config(
     }
 }
 
+/**
+ * @brief 상대에 연결한 QUIC 소켓과 그 소켓에 건 수신 한도.
+ * @details 수신은 반드시 이 한도로 기다려야 한다. 소켓 수신 한도에 기대면 윈도우에서 한도에
+ *          걸리는 순간 도착한 데이터그램을 버린다.
+ */
+pub(crate) struct QuicSocket {
+    /** @brief 상대에 연결한 UDP 소켓. */
+    sock: UdpSocket,
+    /** @brief 이 소켓에 건 수신 한도. */
+    wait: RecvWait,
+}
+
 /** @brief 클라이언트 QUIC 연결 상태를 만든다. 세션 티켓이 있으면 재개를 시도한다. */
 pub(crate) fn new_client_connection(
     addr: SocketAddr,
@@ -241,7 +254,7 @@ pub(crate) fn new_client_connection(
     alpn: &[u8],
     read_timeout: Duration,
     trust: &TrustStore,
-) -> Result<(UdpSocket, Connection), ForwardError> {
+) -> Result<(QuicSocket, Connection), ForwardError> {
     let bind: SocketAddr = if addr.is_ipv4() {
         ([0, 0, 0, 0], 0).into()
     } else {
@@ -249,8 +262,8 @@ pub(crate) fn new_client_connection(
     };
     let sock = onetdns_core::udp::bind(bind).map_err(io_err)?;
     sock.connect(addr).map_err(io_err)?;
-    sock.set_read_timeout(Some(read_timeout.min(POLL)))
-        .map_err(io_err)?;
+    let wait = RecvWait::new(read_timeout.min(POLL));
+    wait.install(&sock).map_err(io_err)?;
 
     let cfg = client_tls_config(addr, server_name, alpn, trust);
     let conn = Connection::new_client(
@@ -260,7 +273,7 @@ pub(crate) fn new_client_connection(
         TransportParams::server_defaults(),
     )
     .map_err(|_| ForwardError::Io("QUIC 클라이언트를 만들지 못했습니다".into()))?;
-    Ok((sock, conn))
+    Ok((QuicSocket { sock, wait }, conn))
 }
 
 /**
@@ -284,21 +297,21 @@ pub(crate) fn check_peer_revocation(
 }
 
 /** @brief 상태가 내보낼 데이터그램을 전부 소켓으로 보낸다. */
-pub(crate) fn flush_out<D: QuicDriven>(sock: &UdpSocket, d: &mut D) -> Result<(), ForwardError> {
+pub(crate) fn flush_out<D: QuicDriven>(sock: &QuicSocket, d: &mut D) -> Result<(), ForwardError> {
     while let Some(dg) = d.next_datagram() {
-        sock.send(&dg).map_err(io_err)?;
+        sock.sock.send(&dg).map_err(io_err)?;
     }
     Ok(())
 }
 
 /** @brief 데이터그램 하나를 받아 상태에 넣고, 그 결과로 나갈 것을 내보낸다. */
 pub(crate) fn recv_once<D: QuicDriven>(
-    sock: &UdpSocket,
+    sock: &QuicSocket,
     d: &mut D,
     buf: &mut [u8],
 ) -> Result<bool, ForwardError> {
     use std::io::ErrorKind;
-    match sock.recv(buf) {
+    match sock.wait.recv(&sock.sock, buf) {
         Ok(n) => {
             d.recv_datagram(&buf[..n]).map_err(|error| {
                 ForwardError::Io(format!("QUIC 데이터그램을 처리하지 못했습니다: {error}"))
@@ -316,7 +329,7 @@ pub(crate) fn recv_once<D: QuicDriven>(
  *          경우를 모두 끊어야 한다.
  */
 pub(crate) fn pump_handshake<D: QuicDriven>(
-    sock: &UdpSocket,
+    sock: &QuicSocket,
     d: &mut D,
     created: Instant,
     deadline: Instant,

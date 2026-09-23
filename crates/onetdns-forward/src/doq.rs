@@ -8,7 +8,9 @@
 use std::cell::RefCell;
 #[cfg(test)]
 use std::collections::HashMap;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
+#[cfg(test)]
+use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
 use onetdns_core::LruMap;
@@ -18,14 +20,14 @@ use onetdns_tls::TrustStore;
 
 use crate::quicdrive::{
     check_peer_revocation, flush_out, harvest_sessions, new_client_connection, pump_handshake,
-    recv_once, silence_limit_ms,
+    recv_once, silence_limit_ms, QuicSocket,
 };
 use crate::{validate_response, ForwardError};
 
 /** @brief 보관 중인 DoQ 연결 하나. */
 struct DoqConn {
     /** @brief 이 연결의 소켓. */
-    sock: UdpSocket,
+    sock: QuicSocket,
     /** @brief 이 연결의 QUIC 상태 기계. */
     conn: Connection,
 

@@ -31,7 +31,7 @@ pub mod swap;
 #[cfg(unix)]
 /** @brief 스레드마다 작은 캐시를 두는 할당기. */
 pub mod talloc;
-/** @brief ICMP 오류가 수신을 깨뜨리지 않는 UDP 소켓. */
+/** @brief ICMP 오류가 수신을 깨뜨리지 않는 UDP 소켓과 데이터그램을 잃지 않는 수신 대기. */
 pub mod udp;
 
 pub use client::{ClientInfo, Transport};

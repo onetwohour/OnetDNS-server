@@ -1640,13 +1640,14 @@ pub fn spawn_dhcp6(
         interface = cfg.interface_index,
         "DHCPv6 클라이언트 multicast 그룹에 가입했습니다"
     );
-    sock.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let wait = onetdns_core::udp::RecvWait::new(Duration::from_millis(500));
+    wait.install(&sock)?;
     std::thread::Builder::new()
         .name("dhcp6".into())
         .spawn(move || {
             let mut buf = vec![0u8; DHCP6_RECV_CAPACITY];
             while !shutdown.load(Ordering::Relaxed) {
-                let (n, peer) = match sock.recv_from(&mut buf) {
+                let (n, peer) = match wait.recv_from(&sock, &mut buf) {
                     Ok(x) => x,
                     Err(error) => {
                         if !matches!(

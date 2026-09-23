@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use onetdns_core::udp::RecvWait;
 use onetdns_proto::Message;
 use onetdns_quic::params::TransportParams;
 use onetdns_quic::retry::{build_retry, parse_initial_header, RetryKey};
@@ -83,7 +84,8 @@ pub fn serve_doq(
     let bound = socket.local_addr()?;
     let stop = Arc::new(AtomicBool::new(false));
     let listener_stop = stop.clone();
-    socket.set_read_timeout(Some(TIMER_INTERVAL))?;
+    let wait = RecvWait::new(TIMER_INTERVAL);
+    wait.install(&socket)?;
     let workers = qworker::default_worker_count();
     let (done_notify, wake_source) = qworker::udp_completion_notifier(bound)?;
     let pool = WorkerPool::new(
@@ -96,7 +98,7 @@ pub fn serve_doq(
         .name("doq-listener".into())
         .spawn(move || {
             let control = QuicRunControl::new(shutdown, listener_stop, memory_budget);
-            run_loop(socket, tls, pool, wake_source, control)
+            run_loop(socket, wait, tls, pool, wake_source, control)
         })?;
     Ok(DoqListener {
         addr: bound,
@@ -168,13 +170,18 @@ fn doq_protocol_error(req: &Message) -> Option<&'static str> {
  */
 const DOQ_PROTOCOL_ERROR: u64 = 0x2;
 
-/** @brief 끝난 질의의 응답을 해당 연결로 보낸다. */
+/**
+ * @brief 끝난 질의의 응답을 해당 연결로 보낸다.
+ * @param now_ms 연결 시계의 지금 시각. 응답 패킷의 전송 시각으로 기록되므로, 낡은 값을
+ *               넘기면 왕복 시간 표본이 실제보다 커지고 PTO 도 실제 전송보다 이르게 잡힌다.
+ */
 fn apply_completions(
     socket: &UdpSocket,
     conns: &mut HashMap<Vec<u8>, ConnEntry>,
     aliases: &mut HashMap<Vec<u8>, Vec<u8>>,
     counts: &mut HashMap<IpAddr, usize>,
     done: &mut Vec<QueryDone>,
+    now_ms: u64,
 ) {
     let mut to_remove: Vec<Vec<u8>> = Vec::new();
     for d in done.drain(..) {
@@ -188,11 +195,14 @@ fn apply_completions(
         let Some(mut wire) = d.wire else {
             continue;
         };
-        // RFC 9250: QUIC 위로 나가는 DNS 메시지의 ID는 0이어야 한다. 받는 쪽에서
-        // 0이 아닌 질의를 이미 끊지만, 내보내는 곳에서도 강제해 어떤 경로로도 새지 않게 한다.
+        /*
+         * RFC 9250 에서 QUIC 위로 나가는 DNS 메시지의 ID 는 0 이어야 한다. 받는 쪽에서 0 이 아닌
+         * 질의를 이미 끊지만, 내보내는 곳에서도 강제해 어떤 경로로도 새지 않게 한다.
+         */
         if let Some(id) = wire.get_mut(..2) {
             id.fill(0);
         }
+        entry.conn.set_now(now_ms);
         if let Err(error) = entry.conn.send_dns_message_owned(d.stream_id, wire) {
             transport_observe::record_error("doq", "send_response", Some(entry.peer), error);
             to_remove.push(d.conn_key);
@@ -355,6 +365,7 @@ fn unique_cid(conns: &HashMap<Vec<u8>, ConnEntry>) -> Vec<u8> {
 /** @brief 데이터그램을 받아 연결마다 넘기고 응답을 내보내는 반복. */
 fn run_loop(
     socket: UdpSocket,
+    wait: RecvWait,
     tls: Arc<onetdns_core::ArcSwap<ServerConfig>>,
     pool: WorkerPool,
     wake_source: SocketAddr,
@@ -381,6 +392,7 @@ fn run_loop(
                     &mut aliases,
                     &mut peer_counts,
                     &mut done_buf,
+                    clock.elapsed().as_millis().min(u64::MAX as u128) as u64,
                 );
             }
             if last_timer.elapsed() >= TIMER_INTERVAL {
@@ -404,7 +416,7 @@ fn run_loop(
             peer_counts.clear();
             done_buf.clear();
         }
-        let (n, peer) = match socket.recv_from(&mut buf) {
+        let (n, peer) = match wait.recv_from(&socket, &mut buf) {
             Ok(x) => x,
             Err(ref e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
@@ -799,19 +811,28 @@ mod tests {
 
     /** @brief QUIC로 질의를 보내고 답을 받는다. */
     fn doq_query(server: SocketAddr, name: &str, qtype: RecordType) -> Message {
-        doq_query_with_blackout(server, name, qtype, Duration::ZERO)
+        doq_query_with_blackout(server, name, qtype, Duration::ZERO, random_cid())
     }
 
-    /** @brief 패킷이 잠시 끊기는 상황을 만들어 질의를 보낸다. */
+    /**
+     * @brief 패킷이 잠시 끊기는 상황을 만들어 질의를 보낸다.
+     * @param client_cid 클라이언트가 쓸 연결 식별자. 길이 0이어도 된다.
+     */
     fn doq_query_with_blackout(
         server: SocketAddr,
         name: &str,
         qtype: RecordType,
         blackout: Duration,
+        client_cid: Vec<u8>,
     ) -> Message {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        sock.set_read_timeout(Some(Duration::from_millis(50)))
-            .unwrap();
+        /*
+         * 블랙아웃 시험은 질의 뒤 클라이언트 타이머를 멈추므로 잃은 데이터그램을 되찾지 못한다.
+         * 소켓 수신 한도에 기대면 윈도우에서 한도에 걸리는 순간 도착한 응답이 사라져 서버
+         * 재전송과 무관하게 실패한다.
+         */
+        let wait = RecvWait::new(Duration::from_millis(50));
+        wait.install(&sock).unwrap();
         let cfg = ClientConfig {
             server_name: "dns.test".into(),
             verify_name: false,
@@ -825,7 +846,7 @@ mod tests {
         let mut client = Connection::new_client(
             cfg,
             random_cid(),
-            random_cid(),
+            client_cid,
             TransportParams::server_defaults(),
         )
         .unwrap();
@@ -873,7 +894,7 @@ mod tests {
                     return Message::parse(&resp).unwrap();
                 }
             }
-            match sock.recv_from(&mut b) {
+            match wait.recv_from(&sock, &mut b) {
                 Ok((n, _)) => {
                     if blackout_started.is_some_and(|started| started.elapsed() < blackout) {
                         continue;
@@ -965,8 +986,34 @@ mod tests {
             "pto.test",
             RecordType::A,
             Duration::from_millis(400),
+            random_cid(),
         );
         assert_eq!(resp.header.id, 0, "RFC 9250 4.2.1: QUIC 위 메시지 ID는 0");
+        assert_eq!(resp.answers.len(), 1);
+    }
+
+    #[test]
+    /**
+     * @brief 길이 0인 연결 식별자를 쓰는 클라이언트의 질의에 답하는지.
+     * @details msquic 을 쓰는 클라이언트가 이렇게 연결한다. 리스너가 그 Initial 을 받아들이지
+     *          않으면 핸드셰이크가 시간 초과로 끝난다.
+     */
+    fn doq_answers_client_with_zero_length_connection_id() {
+        let l = serve_doq(
+            "127.0.0.1:0".parse().unwrap(),
+            std::sync::Arc::new(onetdns_core::ArcSwap::new(self_signed_doq())),
+            native_handler(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            memory_budget(),
+        )
+        .unwrap();
+        let resp = doq_query_with_blackout(
+            l.addr(),
+            "allowed.test",
+            RecordType::A,
+            Duration::ZERO,
+            Vec::new(),
+        );
         assert_eq!(resp.answers.len(), 1);
     }
 }

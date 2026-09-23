@@ -135,7 +135,11 @@ pub fn parse_initial_header(packet: &[u8]) -> Option<InitialHeader<'_>> {
     pos += dcid_len;
     let scid_len = *packet.get(pos)? as usize;
     pos += 1;
-    if scid_len == 0 || scid_len > 20 {
+    /*
+     * 클라이언트는 길이 0인 출발지 연결 식별자를 쓸 수 있고 msquic 이 기본으로 그렇게 한다.
+     * 여기서 막으면 그런 클라이언트의 Initial 을 조용히 버려 연결이 끝내 열리지 않는다.
+     */
+    if scid_len > 20 {
         return None;
     }
     let scid = packet.get(pos..pos + scid_len)?;
@@ -307,5 +311,29 @@ mod tests {
         assert!(!verify_integrity(b"different", &packet));
         packet[8] ^= 1;
         assert!(!verify_integrity(b"original", &packet));
+    }
+
+    #[test]
+    /**
+     * @brief 출발지 연결 식별자가 길이 0인 Initial 을 받아들이는지.
+     * @details msquic 을 쓰는 클라이언트가 이렇게 보낸다. 거부하면 리스너가 그 Initial 을
+     *          조용히 버려 핸드셰이크가 시간 초과로 끝난다.
+     */
+    fn initial_header_accepts_zero_length_source_connection_id() {
+        let mut packet = vec![0xc0];
+        packet.extend_from_slice(&VERSION_1.to_be_bytes());
+        packet.push(8);
+        packet.extend_from_slice(b"ORIGDCID");
+        packet.push(0);
+        packet.push(0);
+        packet.extend_from_slice(&[0u8; 32]);
+
+        let header = parse_initial_header(&packet).expect("길이 0인 출발지 식별자");
+        assert_eq!(header.dcid, b"ORIGDCID");
+        assert!(header.scid.is_empty());
+        assert!(header.token.is_empty());
+
+        let retry = build_retry(header.dcid, header.scid, b"RETRYCID", b"token");
+        assert!(verify_integrity(b"ORIGDCID", &retry));
     }
 }

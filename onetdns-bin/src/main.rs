@@ -13777,11 +13777,10 @@ fn warn_if_dns53_hijacked(
                 let Ok(sock) = std::net::UdpSocket::bind(bind) else {
                     continue;
                 };
-                if sock
-                    .set_read_timeout(Some(probe_timeout.min(Duration::from_millis(250))))
-                    .is_err()
-                    || sock.send_to(&wire, root).is_err()
-                {
+                let wait = onetdns_core::udp::RecvWait::new(
+                    probe_timeout.min(Duration::from_millis(250)),
+                );
+                if wait.install(&sock).is_err() || sock.send_to(&wire, root).is_err() {
                     continue;
                 }
                 let mut buf = [0u8; 1500];
@@ -13790,7 +13789,7 @@ fn warn_if_dns53_hijacked(
                     if shutdown.load(Ordering::Relaxed) {
                         return;
                     }
-                    match sock.recv_from(&mut buf) {
+                    match wait.recv_from(&sock, &mut buf) {
                         Ok(received) => break received,
                         Err(error)
                             if matches!(

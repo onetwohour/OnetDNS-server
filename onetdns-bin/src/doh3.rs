@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use onetdns_core::udp::RecvWait;
 use onetdns_proto::Message;
 use onetdns_quic::params::TransportParams;
 use onetdns_quic::retry::{build_retry, parse_initial_header, RetryKey};
@@ -84,7 +85,8 @@ pub fn serve_doh3(
     let bound = socket.local_addr()?;
     let stop = Arc::new(AtomicBool::new(false));
     let listener_stop = stop.clone();
-    socket.set_read_timeout(Some(TIMER_INTERVAL))?;
+    let wait = RecvWait::new(TIMER_INTERVAL);
+    wait.install(&socket)?;
     let workers = qworker::default_worker_count();
     let (done_notify, wake_source) = qworker::udp_completion_notifier(bound)?;
     let pool = WorkerPool::new(
@@ -97,7 +99,7 @@ pub fn serve_doh3(
         .name("doh3-listener".into())
         .spawn(move || {
             let control = QuicRunControl::new(shutdown, listener_stop, memory_budget);
-            run_loop(socket, tls, doh_path, pool, wake_source, control)
+            run_loop(socket, wait, tls, doh_path, pool, wake_source, control)
         })?;
     Ok(Doh3Listener {
         addr: bound,
@@ -139,13 +141,18 @@ impl ConnEntry {
     }
 }
 
-/** @brief 끝난 질의의 응답을 해당 연결로 보낸다. */
+/**
+ * @brief 끝난 질의의 응답을 해당 연결로 보낸다.
+ * @param now_ms 연결 시계의 지금 시각. 응답 패킷의 전송 시각으로 기록되므로, 낡은 값을
+ *               넘기면 왕복 시간 표본이 실제보다 커지고 PTO 도 실제 전송보다 이르게 잡힌다.
+ */
 fn apply_completions(
     socket: &UdpSocket,
     conns: &mut HashMap<Vec<u8>, ConnEntry>,
     aliases: &mut HashMap<Vec<u8>, Vec<u8>>,
     counts: &mut HashMap<IpAddr, usize>,
     done: &mut Vec<QueryDone>,
+    now_ms: u64,
 ) {
     let mut to_remove: Vec<Vec<u8>> = Vec::new();
     for d in done.drain(..) {
@@ -159,6 +166,7 @@ fn apply_completions(
         let Some(wire) = d.wire else {
             continue;
         };
+        entry.conn.set_now(now_ms);
         if let Err(error) = entry.conn.send_response_owned(d.stream_id, wire, d.max_age) {
             transport_observe::record_error("doh3", "send_response", Some(entry.peer), error);
             to_remove.push(d.conn_key);
@@ -334,6 +342,7 @@ fn match_doh_path(path: &[u8], expected: &str) -> bool {
 /** @brief 데이터그램을 받아 연결마다 넘기고 응답을 내보내는 반복. */
 fn run_loop(
     socket: UdpSocket,
+    wait: RecvWait,
     tls: Arc<onetdns_core::ArcSwap<ServerConfig>>,
     doh_path: String,
     pool: WorkerPool,
@@ -361,6 +370,7 @@ fn run_loop(
                     &mut aliases,
                     &mut peer_counts,
                     &mut done_buf,
+                    clock.elapsed().as_millis().min(u64::MAX as u128) as u64,
                 );
             }
             if last_timer.elapsed() >= TIMER_INTERVAL {
@@ -384,7 +394,7 @@ fn run_loop(
             peer_counts.clear();
             done_buf.clear();
         }
-        let (n, peer) = match socket.recv_from(&mut buf) {
+        let (n, peer) = match wait.recv_from(&socket, &mut buf) {
             Ok(x) => x,
             Err(ref e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>

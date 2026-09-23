@@ -200,7 +200,7 @@ pub fn protect_short(
     payload: &[u8],
     key_phase: bool,
 ) -> Vec<u8> {
-    if !(1..=4).contains(&pn_len) || !(1..=20).contains(&dcid.len()) {
+    if !(1..=4).contains(&pn_len) || dcid.len() > 20 {
         return Vec::new();
     }
     let mut pkt = Vec::new();
@@ -239,48 +239,16 @@ pub fn unprotect_long(
     pkt: &[u8],
     largest_pn: u64,
 ) -> Option<LongPacket> {
-    let first0 = *pkt.first()?;
-    if first0 & 0x80 == 0 {
-        return None;
-    }
-    let ptype_val = (first0 & 0x30) >> 4;
-    let mut pos = 1usize;
-    let version = u32::from_be_bytes(pkt.get(pos..pos + 4)?.try_into().ok()?);
-    pos += 4;
-    let dcid_len = *pkt.get(pos)? as usize;
-    if dcid_len > 20 {
-        return None;
-    }
-    pos += 1;
-    let dcid = pkt.get(pos..pos + dcid_len)?.to_vec();
-    pos += dcid_len;
-    let scid_len = *pkt.get(pos)? as usize;
-    if scid_len > 20 {
-        return None;
-    }
-    pos += 1;
-    let scid = pkt.get(pos..pos + scid_len)?.to_vec();
-    pos += scid_len;
-    let token = if ptype_val == ptype::INITIAL {
-        let (tl, n) = varint::read(pkt.get(pos..)?)?;
-        let tl = usize::try_from(tl).ok()?;
-        if tl > 256 {
-            return None;
-        }
-        pos += n;
-        let t = pkt.get(pos..pos + tl)?.to_vec();
-        pos += tl;
-        t
-    } else {
-        Vec::new()
-    };
-    let (length, n) = varint::read(pkt.get(pos..)?)?;
-    pos += n;
-    let pn_offset = pos;
-    let pkt_end = pn_offset.checked_add(usize::try_from(length).ok()?)?;
-    if pkt_end > pkt.len() {
-        return None;
-    }
+    let LongHeader {
+        ptype: ptype_val,
+        version,
+        dcid,
+        scid,
+        token,
+        pn_offset,
+        end: pkt_end,
+    } = parse_long_header(pkt)?;
+    let first0 = pkt[0];
 
     let sample: [u8; 16] = pkt
         .get(pn_offset + 4..pn_offset + 4 + 16)?
@@ -299,13 +267,102 @@ pub fn unprotect_long(
     Some(LongPacket {
         ptype: ptype_val,
         version,
-        dcid,
-        scid,
-        token,
+        dcid: dcid.to_vec(),
+        scid: scid.to_vec(),
+        token: token.to_vec(),
         pn,
         payload,
         consumed: pkt_end,
     })
+}
+
+/** @brief 암호를 풀기 전에 읽을 수 있는 긴 헤더 필드. */
+struct LongHeader<'a> {
+    /** @brief 패킷 종류. */
+    ptype: u8,
+    /** @brief 프로토콜 버전. */
+    version: u32,
+    /** @brief 받는 쪽 연결 식별자. */
+    dcid: &'a [u8],
+    /** @brief 보내는 쪽 연결 식별자. */
+    scid: &'a [u8],
+    /** @brief 재시도 토큰. Initial 이 아니면 비어 있다. */
+    token: &'a [u8],
+    /** @brief 패킷 번호가 시작하는 위치. */
+    pn_offset: usize,
+    /** @brief 이 패킷이 끝나는 위치. 뒤에 다른 패킷이 합쳐져 있을 수 있다. */
+    end: usize,
+}
+
+/**
+ * @brief 길이 필드까지 긴 헤더를 읽는다.
+ * @details Retry 에는 길이 필드가 없으므로 받지 않는다.
+ */
+fn parse_long_header(pkt: &[u8]) -> Option<LongHeader<'_>> {
+    let first = *pkt.first()?;
+    if first & 0x80 == 0 {
+        return None;
+    }
+    let ptype_val = (first & 0x30) >> 4;
+    if ptype_val == ptype::RETRY {
+        return None;
+    }
+    let mut pos = 1usize;
+    let version = u32::from_be_bytes(pkt.get(pos..pos + 4)?.try_into().ok()?);
+    pos += 4;
+    let dcid_len = *pkt.get(pos)? as usize;
+    if dcid_len > 20 {
+        return None;
+    }
+    pos += 1;
+    let dcid = pkt.get(pos..pos + dcid_len)?;
+    pos += dcid_len;
+    let scid_len = *pkt.get(pos)? as usize;
+    if scid_len > 20 {
+        return None;
+    }
+    pos += 1;
+    let scid = pkt.get(pos..pos + scid_len)?;
+    pos += scid_len;
+    let token: &[u8] = if ptype_val == ptype::INITIAL {
+        let (tl, n) = varint::read(pkt.get(pos..)?)?;
+        let tl = usize::try_from(tl).ok()?;
+        if tl > 256 {
+            return None;
+        }
+        pos += n;
+        let t = pkt.get(pos..pos + tl)?;
+        pos += tl;
+        t
+    } else {
+        &[]
+    };
+    let (length, n) = varint::read(pkt.get(pos..)?)?;
+    pos += n;
+    let end = pos.checked_add(usize::try_from(length).ok()?)?;
+    if end > pkt.len() {
+        return None;
+    }
+    Some(LongHeader {
+        ptype: ptype_val,
+        version,
+        dcid,
+        scid,
+        token,
+        pn_offset: pos,
+        end,
+    })
+}
+
+/**
+ * @brief 긴 헤더 패킷 하나가 데이터그램에서 차지하는 바이트.
+ * @details 키가 없거나 풀리지 않는 패킷을 건너뛰고 뒤에 합쳐진 패킷을 계속 처리할 때 쓴다.
+ *          RFC 9000 은 합쳐진 패킷 하나를 풀지 못해도 나머지는 처리하라고 한다. 버린 번호
+ *          공간의 패킷 뒤에 붙어 온 패킷까지 버리면 핸드셰이크가 멈춘다.
+ * @return 헤더가 깨졌거나 Retry 이면 None.
+ */
+pub fn long_packet_len(pkt: &[u8]) -> Option<usize> {
+    parse_long_header(pkt).map(|header| header.end)
 }
 
 /** @brief 짧은 헤더 패킷의 보호를 벗기고 본문을 푼다. */
@@ -506,6 +563,25 @@ mod tests {
         assert_eq!(sp.dcid, dcid);
         assert_eq!(sp.pn, 42);
         assert_eq!(sp.payload, payload);
+    }
+
+    #[test]
+    /**
+     * @brief 목적지 연결 식별자가 길이 0인 짧은 헤더 패킷이 왕복하는지.
+     * @details 길이 0인 식별자를 쓰는 클라이언트에게 서버가 보내는 모양이다. 한 바이트짜리
+     *          프레임만 실어도 헤더 보호 표본이 모자라지 않게 채워져야 한다.
+     */
+    fn short_packet_with_zero_length_dcid_roundtrips() {
+        let secret = [0x5au8; 32];
+        let keys = crate::derive_packet_keys(&secret, 16);
+        let pkt = protect_short(Aead::Aes128Gcm, &keys, &[], 7, 4, &[0x1e], false);
+        assert!(!pkt.is_empty());
+
+        let (sp, _) =
+            unprotect_short(Aead::Aes128Gcm, &keys, None, false, &pkt, 0, 0).expect("해제");
+        assert!(sp.dcid.is_empty());
+        assert_eq!(sp.pn, 7);
+        assert_eq!(sp.payload[0], 0x1e);
     }
 
     #[test]
